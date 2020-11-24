@@ -1,7 +1,6 @@
 # AI assited medical diagnosis of knee injuries.
 
-This repository contains an implementation of research paper <a href="https://stanfordmlgroup.github.io/projects/mrnet/">MRNet: Deep-learning-assisted diagnosis for knee magnetic resonance></a> with slight modifications. The Original paper trains three models for each class and then predict class with max value among the prediciton all three models.
-  I on the other hand trained a end to end single model for predicing class probabilities of all three classes.
+This repository contains an implementation of research paper <a href="https://stanfordmlgroup.github.io/projects/mrnet/">MRNet: Deep-learning-assisted diagnosis for knee magnetic resonance</a> with slight modifications. The Original paper trains three models for each class and then predict class with max value among the prediciton all three models. I on the other hand trained a end to end single model for predicing class probabilities of all three classes which reduce training time 5x.
 
 
 ## Dataset: MRNet 
