@@ -28,7 +28,7 @@ parser.add_argument('--patience', type=int, choices=[0, 1], default=20)
 
 example to train a model to detect acl tears on the sagittal plane for a 20 epochs:
 
-`python train.py --epochs=20`
+`python train.py --epochs=100
 
 Note: Before running the script, add the following (empty) folders at the root of the project:
 - models
