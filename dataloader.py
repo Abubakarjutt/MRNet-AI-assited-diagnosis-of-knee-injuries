@@ -67,31 +67,12 @@ class MRDataset(data.Dataset):
 
     def __getitem__(self, index):
         array = np.load(self.paths[index])
-        label_abnormal = self.labels_abnormal[index]
-        label_acl = self.labels_acl[index]
-        label_meniscus = self.labels_meniscus[index]
-        if label_abnormal == 1 and label_acl == 1 and label_meniscus ==1:
-            label = torch.FloatTensor([1, 1, 1])
-        elif label_abnormal == 0 and label_acl == 1 and label_meniscus ==1:
-            label = torch.FloatTensor([0, 1, 1])
-        elif label_abnormal == 1 and label_acl == 0 and label_meniscus ==1:
-            label = torch.FloatTensor([1, 0, 1])
-        elif label_abnormal == 1 and label_acl == 1 and label_meniscus ==0:
-            label = torch.FloatTensor([1, 1, 0])
-        else:
-            label = torch.FloatTensor([0, 0, 0])
+        label = torch.FloatTensor([self.labels_abnormal[index], self.labels_acl[index], self.labels_meniscus[index])
 
         if self.transform:
             array = self.transform(array)
         else:
             array = np.stack((array,)*3, axis=1)
             array = torch.FloatTensor(array)
-
-        # if label.item() == 1:
-        #     weight = np.array([self.weights[1]])
-        #     weight = torch.FloatTensor(weight)
-        # else:
-        #     weight = np.array([self.weights[0]])
-        #     weight = torch.FloatTensor(weight)
 
         return array, label, self.weights
