@@ -8,27 +8,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.autograd import Variable
-from torchsample.transforms import RandomRotate, RandomTranslate, RandomFlip, ToTensor, Compose, RandomAffine
 from torchvision import transforms
-import torch.nn.functional as F
 from tensorboardX import SummaryWriter
+from sklearn import metrics
 
 from dataloader import MRDataset
-import model
+import vit
+import utils
 
-from sklearn import metrics
-import alexnet
-import geomloss
-
-
-
-def train_model(model, sagittal_train_loader, coronal_train_loader, axial_train_loader, epoch, num_epochs, optimizer, writer, current_lr, log_every=100):
+def train_model(model, train_loaders, epoch, num_epochs, optimizer, writer, current_lr, device, log_every=100):
     _ = model.train()
+    model.to(device)
 
-    if torch.cuda.is_available():
-        model.cuda()
-
+    sagittal_train_loader, coronal_train_loader, axial_train_loader = train_loaders
+    
     y_preds = []
     y_trues = []
     losses = []
@@ -36,29 +29,20 @@ def train_model(model, sagittal_train_loader, coronal_train_loader, axial_train_
     for i, ((sagittal_image, label, weight), (coronal_image, _ ,_), (axial_image, _ ,_))  in enumerate(zip(sagittal_train_loader, coronal_train_loader, axial_train_loader)):
         optimizer.zero_grad()
 
-        if torch.cuda.is_available():
-              sagittal_image = sagittal_image.cuda()
-              coronal_image = coronal_image.cuda()
-              axial_image = axial_image.cuda()
-              label = label.cuda()
-              weight = weight.cuda()
+        sagittal_image = sagittal_image.to(device)
+        coronal_image = coronal_image.to(device)
+        axial_image = axial_image.to(device)
+        label = label.to(device)
+        weight = weight.to(device)
 
-
-        label = label
-        weight = weight
-
-
-
-        prediction = model.forward(sagittal_image / 255.0, coronal_image / 255.0, axial_image / 255.0)
-        #loss = geomloss.SamplesLoss()(prediction, label)
+        sagittal_image = utils.normalize(sagittal_image / 255.0, device)
+        coronal_image = utils.normalize(coronal_image / 255.0, device)
+        axial_image = utils.normalize(axial_image / 255.0, device)
+        prediction = model.forward(sagittal_image, coronal_image, axial_image)
         loss = nn.BCEWithLogitsLoss(weight=weight)(prediction, label)
-        #loss = nn.MultiLabelSoftMarginLoss(weight=weights)(prediction, label)
-        #loss = F.smooth_l1_loss(prediction, label)
-
-
-
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         loss_value = loss.item()
@@ -70,18 +54,19 @@ def train_model(model, sagittal_train_loader, coronal_train_loader, axial_train_
         y_trues.append(int(label[0][1]))
         y_trues.append(int(label[0][2]))
 
-
         y_preds.append(probas[0][0].item())
         y_preds.append(probas[0][1].item())
         y_preds.append(probas[0][2].item())
 
         try:
-            auc = metrics.roc_auc_score(y_trues, y_preds)
+            if len(np.unique(y_trues)) > 1:
+                auc = metrics.roc_auc_score(y_trues, y_preds)
+            else:
+                auc = 0.5
         except:
             auc = 0.5
 
-        writer.add_scalar('Train/Loss', loss_value,
-                          epoch * len(sagittal_train_loader) + i)
+        writer.add_scalar('Train/Loss', loss_value, epoch * len(sagittal_train_loader) + i)
         writer.add_scalar('Train/AUC', auc, epoch * len(sagittal_train_loader) + i)
 
         if (i % log_every == 0) & (i > 0):
@@ -104,11 +89,11 @@ def train_model(model, sagittal_train_loader, coronal_train_loader, axial_train_
     return train_loss_epoch, train_auc_epoch, y_trues, y_preds
 
 
-def evaluate_model(model, sagittal_validation_loader, coronal_validation_loader, axial_validation_loader, epoch, num_epochs, writer, current_lr, log_every=20):
+def evaluate_model(model, val_loaders, epoch, num_epochs, writer, current_lr, device, log_every=20):
     _ = model.eval()
+    model.to(device)
 
-    if torch.cuda.is_available():
-        model.cuda()
+    sagittal_validation_loader, coronal_validation_loader, axial_validation_loader = val_loaders
 
     y_trues = []
     y_preds = []
@@ -116,23 +101,17 @@ def evaluate_model(model, sagittal_validation_loader, coronal_validation_loader,
 
     for i, ((sagittal_image, label, weight), (coronal_image, _ ,_), (axial_image, _ ,_)) in enumerate(zip(sagittal_validation_loader, coronal_validation_loader, axial_validation_loader)):
 
+        sagittal_image = sagittal_image.to(device)
+        coronal_image = coronal_image.to(device)
+        axial_image = axial_image.to(device)
+        label = label.to(device)
+        weight = weight.to(device)
 
-        if torch.cuda.is_available():
-              sagittal_image = sagittal_image.cuda()
-              coronal_image = coronal_image.cuda()
-              axial_image = axial_image.cuda()
-              label = label.cuda()
-              weight = weight.cuda()
-
-        label = label
-        weight = weight
-
-
-        prediction = model.forward(sagittal_image / 255.0, coronal_image / 255.0, axial_image / 255.0)
-        #loss = geomloss.SamplesLoss()(prediction, label)
+        sagittal_image = utils.normalize(sagittal_image / 255.0, device)
+        coronal_image = utils.normalize(coronal_image / 255.0, device)
+        axial_image = utils.normalize(axial_image / 255.0, device)
+        prediction = model.forward(sagittal_image, coronal_image, axial_image)
         loss = nn.BCEWithLogitsLoss(weight=weight)(prediction, label)
-        #loss = nn.MultiLabelSoftMarginLoss(weight=weights)(prediction, label)
-        #loss = F.smooth_l1_loss(prediction, label)
 
         loss_value = loss.item()
         losses.append(loss_value)
@@ -143,13 +122,15 @@ def evaluate_model(model, sagittal_validation_loader, coronal_validation_loader,
         y_trues.append(int(label[0][1]))
         y_trues.append(int(label[0][2]))
 
-
         y_preds.append(probas[0][0].item())
         y_preds.append(probas[0][1].item())
         y_preds.append(probas[0][2].item())
 
         try:
-            auc = metrics.roc_auc_score(y_trues, y_preds)
+            if len(np.unique(y_trues)) > 1:
+                auc = metrics.roc_auc_score(y_trues, y_preds)
+            else:
+                auc = 0.5
         except:
             auc = 0.5
 
@@ -175,12 +156,19 @@ def evaluate_model(model, sagittal_validation_loader, coronal_validation_loader,
     val_auc_epoch = np.round(auc, 4)
     return val_loss_epoch, val_auc_epoch, y_trues, y_preds
 
-def get_lr(optimizer):
-    for param_group in optimizer.param_groups:
-        return param_group['lr']
-
 
 def run(args):
+    # Determine device
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using MPS device.")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using CUDA device.")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU device.")
+
     log_root_folder = "./logs/{0}/{1}/".format(args.task, args.plane)
     if args.flush_history == 1:
         objects = os.listdir(log_root_folder)
@@ -190,16 +178,22 @@ def run(args):
 
     now = datetime.now()
     logdir = log_root_folder + now.strftime("%Y%m%d-%H%M%S") + "/"
-    os.makedirs(logdir)
+    os.makedirs(logdir, exist_ok=True)
 
     writer = SummaryWriter(logdir)
 
-    augmentor = Compose([
-        transforms.Lambda(lambda x: torch.Tensor(x)),
-        #RandomRotate(25),
-        #RandomTranslate([0.11, 0.11]),
-        #RandomFlip(),
-        transforms.Lambda(lambda x: x.repeat(3, 1, 1, 1).permute(1, 0, 2, 3)),
+    augmentor = transforms.Compose([
+        transforms.Lambda(utils.convert_to_tensor),
+        transforms.Resize((224, 224)),
+        transforms.RandomAffine(degrees=25, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        transforms.RandomHorizontalFlip(),
+        transforms.Lambda(utils.repeat_and_permute),
+    ])
+
+    val_augmentor = transforms.Compose([
+        transforms.Lambda(utils.convert_to_tensor),
+        transforms.Resize((224, 224)),
+        transforms.Lambda(utils.repeat_and_permute),
     ])
 
     sagittal_train_dataset = MRDataset('MRNet-v1.0/', 'sagittal', transform=augmentor, train=True)
@@ -210,29 +204,22 @@ def run(args):
     coronal_train_loader = torch.utils.data.DataLoader(coronal_train_dataset, batch_size=1, shuffle=True, num_workers=1, drop_last=False)
     axial_train_loader = torch.utils.data.DataLoader(axial_train_dataset, batch_size=1, shuffle=True, num_workers=1, drop_last=False)
 
+    sagittal_validation_dataset = MRDataset( 'MRNet-v1.0/', 'sagittal', transform=val_augmentor, train=False)
+    coronal_validation_dataset = MRDataset( 'MRNet-v1.0/',  'coronal', transform=val_augmentor, train=False)
+    axial_validation_dataset = MRDataset( 'MRNet-v1.0/', 'axial', transform=val_augmentor, train=False)
 
-    sagittal_validation_dataset = MRDataset( 'MRNet-v1.0/', 'sagittal', train=False)
-    coronal_validation_dataset = MRDataset( 'MRNet-v1.0/',  'coronal', train=False)
-    axial_validation_dataset = MRDataset( 'MRNet-v1.0/', 'axial', train=False)
+    sagittal_validation_loader = torch.utils.data.DataLoader(sagittal_validation_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False)
+    coronal_validation_loader = torch.utils.data.DataLoader(coronal_validation_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False)
+    axial_validation_loader = torch.utils.data.DataLoader(axial_validation_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False)
 
-    sagittal_validation_loader = torch.utils.data.DataLoader(sagittal_validation_dataset, batch_size=1, shuffle=-True, num_workers=1, drop_last=False)
-    coronal_validation_loader = torch.utils.data.DataLoader(coronal_validation_dataset, batch_size=1, shuffle=-True, num_workers=1, drop_last=False)
-    axial_validation_loader = torch.utils.data.DataLoader(axial_validation_dataset, batch_size=1, shuffle=-True, num_workers=1, drop_last=False)
+    train_loaders = (sagittal_train_loader, coronal_train_loader, axial_train_loader)
+    val_loaders = (sagittal_validation_loader, coronal_validation_loader, axial_validation_loader)
 
-    mrnet = alexnet.AlexNet()
-    torch.cuda.empty_cache()
-
-
-    if torch.cuda.is_available():
-        mrnet = mrnet.cuda()
-
+    mrnet = vit.MRNetViT()
+    mrnet.to(device)
 
     optimizer = optim.Adam(mrnet.parameters(), lr=args.lr, weight_decay=0)
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=.3, threshold=1e-4, verbose=True)
-
-
-
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=.3, threshold=1e-4)
 
     best_val_loss = float('inf')
     best_val_auc = float(0)
@@ -245,20 +232,16 @@ def run(args):
     t_start_training = time.time()
 
     for epoch in range(num_epochs):
-        current_lr = get_lr(optimizer)
-
-
+        current_lr = utils.get_lr(optimizer)
         t_start = time.time()
 
         train_loss, train_auc, train_y_trues, train_y_preds = train_model(
-            mrnet, sagittal_train_loader, coronal_train_loader, axial_train_loader, epoch, num_epochs, optimizer, writer, current_lr, log_every)
+            mrnet, train_loaders, epoch, num_epochs, optimizer, writer, current_lr, device, log_every)
+        
         val_loss, val_auc, val_y_trues, val_y_preds = evaluate_model(
-            mrnet, sagittal_validation_loader, coronal_validation_loader, axial_validation_loader, epoch, num_epochs, writer, current_lr)
+            mrnet, val_loaders, epoch, num_epochs, writer, current_lr, device)
 
         scheduler.step(val_loss)
-
-
-
 
         t_end = time.time()
         delta = t_end - t_start
@@ -275,15 +258,15 @@ def run(args):
         print("val_true_negatives :{0} | val_false_positives {1} | val_false_negatives {2} | val_true_positives {3}".format(
             val_true_negatives, val_false_positives, val_false_negatives, val_true_positives))
 
-
         iteration_change_loss += 1
         print('-' * 30)
-
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             if bool(args.save_model):
                 file_name = f'model_{args.prefix_name}_{args.task}_{args.plane}_val_auc_{val_auc:0.4f}_train_auc_{train_auc:0.4f}_epoch_{epoch+1}.pth'
+                # Ensure models directory exists
+                os.makedirs('models', exist_ok=True)
                 for f in os.listdir('models/'):
                     if (args.task in f) and (args.plane in f) and (args.prefix_name in f):
                         os.remove(f'models/{f}')
