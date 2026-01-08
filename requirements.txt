@@ -1,0 +1,6 @@
+torch
+torchvision
+tensorboardX
+scikit-learn
+pandas
+geomloss
