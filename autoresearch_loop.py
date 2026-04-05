@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
     "amp": 1,
     "channels_last": 1,
     "time_budget_minutes": 5,
-    "pretrained": 1,
+    "pretrained": 0,
     "mmap": 1,
     "save_model": 0,
     "batch_size": 1,
@@ -188,7 +188,20 @@ def run_candidate(script_dir, logs_dir, config_dir, cache_dir, iteration, candid
         log_text = handle.read()
 
     summary = parse_summary(log_text)
-    return candidate_name, config_path, log_path, process.returncode, summary
+    return candidate_name, config_path, log_path, process.returncode, summary, log_text
+
+
+def should_retry_without_pretrained(returncode, log_text, candidate_config):
+    if returncode == 0 or int(candidate_config.get("pretrained", 0)) != 1:
+        return False
+
+    retry_markers = [
+        "CERTIFICATE_VERIFY_FAILED",
+        "urllib.error.URLError",
+        "ssl.SSLCertVerificationError",
+        "download.pytorch.org/models",
+    ]
+    return any(marker in log_text for marker in retry_markers)
 
 
 def write_markdown_summary(path, state, rows):
@@ -264,7 +277,7 @@ def run(args):
         parent = deepcopy(state["best"])
         candidate_config, mutations = mutate_config(parent["config"], rng)
         candidate_config = apply_runtime_overrides(candidate_config, args)
-        candidate_name, config_path, log_path, returncode, summary = run_candidate(
+        candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
             script_dir=script_dir,
             logs_dir=logs_dir,
             config_dir=config_dir,
@@ -273,6 +286,18 @@ def run(args):
             candidate=candidate_config,
             data_root=args.data_root,
         )
+        if should_retry_without_pretrained(returncode, log_text, candidate_config):
+            candidate_config["pretrained"] = 0
+            mutations.append("pretrained:1->0(auto-retry)")
+            candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
+                script_dir=script_dir,
+                logs_dir=logs_dir,
+                config_dir=config_dir,
+                cache_dir=cache_dir,
+                iteration=state["iteration"],
+                candidate=candidate_config,
+                data_root=args.data_root,
+            )
 
         candidate_auc = float_or_default(summary["best_val_auc"])
         status = "crash"
