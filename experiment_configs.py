@@ -1,0 +1,115 @@
+SHORT_EXPERIMENTS = [
+    {
+        "name": "resnet18_short",
+        "description": "5-minute ResNet-18 baseline with MPS-friendly preprocessing.",
+        "args": {
+            "model_type": "resnet18",
+            "lr": 3e-4,
+            "weight_decay": 1e-4,
+            "dropout": 0.2,
+            "epochs": 8,
+            "patience": 3,
+            "num_workers": 2,
+            "cache_size": 32,
+            "amp": 1,
+            "channels_last": 1,
+            "time_budget_minutes": 5,
+        },
+    },
+    {
+        "name": "mobilenet_v3_short",
+        "description": "Fastest compact baseline using MobileNetV3-Small and a 5-minute budget.",
+        "args": {
+            "model_type": "mobilenet_v3_small",
+            "lr": 4e-4,
+            "weight_decay": 1e-4,
+            "dropout": 0.15,
+            "epochs": 10,
+            "patience": 3,
+            "num_workers": 2,
+            "cache_size": 32,
+            "amp": 1,
+            "channels_last": 1,
+            "time_budget_minutes": 5,
+        },
+    },
+    {
+        "name": "efficientnet_b0_short",
+        "description": "Balanced compact baseline with EfficientNet-B0 on a 5-minute budget.",
+        "args": {
+            "model_type": "efficientnet_b0",
+            "lr": 3e-4,
+            "weight_decay": 1e-4,
+            "dropout": 0.2,
+            "epochs": 8,
+            "patience": 3,
+            "num_workers": 2,
+            "cache_size": 32,
+            "amp": 1,
+            "channels_last": 1,
+            "time_budget_minutes": 5,
+        },
+    },
+]
+
+FULL_EXPERIMENTS = [
+    {
+        "name": "resnet18_baseline",
+        "description": "Shared ResNet-18 encoder with GPU-side preprocessing; fast default baseline.",
+        "args": {
+            "model_type": "resnet18",
+            "lr": 3e-4,
+            "weight_decay": 1e-4,
+            "dropout": 0.2,
+            "epochs": 20,
+            "patience": 6,
+            "num_workers": 2,
+            "cache_size": 48,
+            "amp": 1,
+            "channels_last": 1,
+            "time_budget_minutes": 20,
+        },
+    },
+    {
+        "name": "mobilenet_small_fast",
+        "description": "MobileNetV3-Small for maximum throughput with pretrained ImageNet features.",
+        "args": {
+            "model_type": "mobilenet_v3_small",
+            "lr": 4e-4,
+            "weight_decay": 1e-4,
+            "dropout": 0.15,
+            "epochs": 20,
+            "patience": 6,
+            "num_workers": 2,
+            "cache_size": 48,
+            "amp": 1,
+            "channels_last": 1,
+            "time_budget_minutes": 20,
+        },
+    },
+    {
+        "name": "efficientnet_b0_balanced",
+        "description": "EfficientNet-B0 as a slightly heavier but still compact accuracy-oriented option.",
+        "args": {
+            "model_type": "efficientnet_b0",
+            "lr": 3e-4,
+            "weight_decay": 1e-4,
+            "dropout": 0.2,
+            "epochs": 20,
+            "patience": 6,
+            "num_workers": 2,
+            "cache_size": 48,
+            "amp": 1,
+            "channels_last": 1,
+            "time_budget_minutes": 20,
+        },
+    },
+]
+
+EXPERIMENT_GROUPS = {
+    "short": SHORT_EXPERIMENTS,
+    "full": FULL_EXPERIMENTS,
+    "all": SHORT_EXPERIMENTS + FULL_EXPERIMENTS,
+}
+
+DEFAULT_GROUP = "short"

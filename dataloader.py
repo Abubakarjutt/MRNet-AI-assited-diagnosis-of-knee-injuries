@@ -1,70 +1,124 @@
-import pandas as pd
+import os
+from collections import OrderedDict
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.utils.data as data
-from torchvision import transforms
+
+
+PLANES = ("sagittal", "coronal", "axial")
+TASKS = ("abnormal", "acl", "meniscus")
+
+
+def _zero_pad_exam_id(exam_id):
+    return f"{int(exam_id):04d}"
+
+
+def _read_split_records(root_dir, split):
+    frames = []
+    for task in TASKS:
+        csv_path = os.path.join(root_dir, f"{split}-{task}.csv")
+        frame = pd.read_csv(csv_path, header=None, names=["id", task])
+        frame["id"] = frame["id"].map(_zero_pad_exam_id)
+        frames.append(frame)
+
+    merged = frames[0]
+    for frame in frames[1:]:
+        merged = merged.merge(frame, on="id", how="inner")
+
+    merged = merged.sort_values("id").reset_index(drop=True)
+    return merged
 
 
 class MRDataset(data.Dataset):
-    def __init__(self, root_dir, plane, train=True, transform=None, weights=None):
+    """
+    Backwards-compatible single-plane dataset.
+    Prefer `MRMultiPlaneDataset` for training because it keeps plane ordering aligned.
+    """
+
+    def __init__(self, root_dir, plane, train=True, transform=None, weights=None, mmap=True):
         super().__init__()
+        split = "train" if train else "valid"
+        self.records = _read_split_records(root_dir, split)
         self.plane = plane
-        self.root_dir = root_dir
-        self.train = train
         self.transform = transform
-        if self.train:
-            self.folder_path = self.root_dir + 'train/{0}/'.format(plane)
-            self.records_abnormal = pd.read_csv(self.root_dir + 'train-abnormal.csv', header=None, names=['id', 'label'])
-            self.records_acl = pd.read_csv(self.root_dir + 'train-acl.csv', header=None, names=['id', 'label'])
-            self.records_meniscus = pd.read_csv(self.root_dir + 'train-meniscus.csv', header=None, names=['id', 'label'])
-
-        else:
-            self.folder_path = self.root_dir + 'valid/{0}/'.format(plane)
-            self.records_abnormal = pd.read_csv(self.root_dir + 'valid-abnormal.csv', header=None, names=['id', 'label'])
-            self.records_acl = pd.read_csv(self.root_dir + 'valid-acl.csv', header=None, names=['id', 'label'])
-            self.records_meniscus = pd.read_csv(self.root_dir + 'valid-meniscus.csv', header=None, names=['id', 'label'])
-
-        self.records_abnormal['id'] = self.records_abnormal['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
-        self.records_acl['id'] = self.records_acl['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
-        self.records_meniscus['id'] = self.records_meniscus['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
-
-        self.paths = [self.folder_path + filename +'.npy' for filename in self.records_abnormal['id'].tolist()]
-        self.labels_abnormal = self.records_abnormal['label'].tolist()
-        self.labels_acl = self.records_acl['label'].tolist()
-        self.labels_meniscus = self.records_meniscus['label'].tolist()
-        if weights is None:
-            pos_abnormal = np.sum(self.labels_abnormal)
-            neg_abnormal = len(self.labels_abnormal) - pos_abnormal
-            weights_abnormal = torch.FloatTensor([1, neg_abnormal / pos_abnormal])
-
-
-            pos_acl = np.sum(self.labels_acl)
-            neg_acl = len(self.labels_acl) - pos_acl
-            weights_acl = torch.FloatTensor([1, neg_acl / pos_acl])
-
-
-            pos_meniscus = np.sum(self.labels_meniscus)
-            neg_meniscus = len(self.labels_meniscus) - pos_meniscus
-            weights_meniscus = torch.FloatTensor([1, neg_meniscus / pos_meniscus])
-
-
-
-            self.weights = torch.Tensor([weights_abnormal[1] ,weights_acl[1], weights_meniscus[1]])
-
-        else:
-            self.weights = torch.FloatTensor(weights)
+        self.mmap = mmap
+        self.folder_path = os.path.join(root_dir, split, plane)
+        self.paths = [
+            os.path.join(self.folder_path, f"{exam_id}.npy")
+            for exam_id in self.records["id"].tolist()
+        ]
+        self.labels = self.records[list(TASKS)].to_numpy(dtype=np.float32)
+        self.weights = _compute_class_weights(self.labels) if weights is None else torch.tensor(weights, dtype=torch.float32)
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
-        array = np.load(self.paths[index])
-        label = torch.FloatTensor([self.labels_abnormal[index], self.labels_acl[index], self.labels_meniscus[index]])
+        mmap_mode = "r" if self.mmap else None
+        array = np.load(self.paths[index], mmap_mode=mmap_mode)
+        tensor = torch.from_numpy(np.asarray(array, dtype=np.float32))
+        label = torch.from_numpy(self.labels[index])
 
         if self.transform:
-            array = self.transform(array)
-        else:
-            array = np.stack((array,)*3, axis=1)
-            array = torch.FloatTensor(array)
+            tensor = self.transform(tensor)
 
-        return array, label, self.weights
+        return tensor, label, self.weights
+
+
+def _compute_class_weights(labels):
+    positive_counts = labels.sum(axis=0)
+    negative_counts = labels.shape[0] - positive_counts
+    safe_positive = np.clip(positive_counts, a_min=1.0, a_max=None)
+    weights = negative_counts / safe_positive
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+class MRMultiPlaneDataset(data.Dataset):
+    def __init__(self, root_dir, train=True, planes=PLANES, mmap=True, cache_size=32):
+        super().__init__()
+        split = "train" if train else "valid"
+        self.root_dir = root_dir
+        self.split = split
+        self.planes = tuple(planes)
+        self.mmap = mmap
+        self.records = _read_split_records(root_dir, split)
+        self.exam_ids = self.records["id"].tolist()
+        self.labels = self.records[list(TASKS)].to_numpy(dtype=np.float32)
+        self.weights = _compute_class_weights(self.labels)
+        self.plane_paths = {
+            plane: [
+                os.path.join(root_dir, split, plane, f"{exam_id}.npy")
+                for exam_id in self.exam_ids
+            ]
+            for plane in self.planes
+        }
+        self.cache_size = max(int(cache_size), 0)
+        self._cache = OrderedDict()
+
+    def __len__(self):
+        return len(self.exam_ids)
+
+    def _load_volume(self, plane, index):
+        cache_key = (plane, index)
+        if cache_key in self._cache:
+            volume = self._cache.pop(cache_key)
+            self._cache[cache_key] = volume
+            return volume
+
+        mmap_mode = "r" if self.mmap else None
+        volume = np.load(self.plane_paths[plane][index], mmap_mode=mmap_mode)
+        volume = torch.from_numpy(np.asarray(volume, dtype=np.float32))
+
+        if self.cache_size:
+            self._cache[cache_key] = volume
+            if len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+
+        return volume
+
+    def __getitem__(self, index):
+        volumes = tuple(self._load_volume(plane, index) for plane in self.planes)
+        label = torch.from_numpy(self.labels[index])
+        return volumes, label, self.weights, self.exam_ids[index]

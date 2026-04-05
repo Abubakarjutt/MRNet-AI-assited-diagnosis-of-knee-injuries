@@ -1,309 +1,435 @@
-import shutil
+import argparse
 import os
+import shutil
 import time
 from datetime import datetime
-import argparse
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms
-from tensorboardX import SummaryWriter
 from sklearn import metrics
 
-from dataloader import MRDataset
-import vit
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    class SummaryWriter:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+import advanced_vit
+import lightweight_models
 import utils
+from dataloader import MRMultiPlaneDataset
 
-def train_model(model, train_loaders, epoch, num_epochs, optimizer, writer, current_lr, device, log_every=100):
-    _ = model.train()
-    model.to(device)
 
-    sagittal_train_loader, coronal_train_loader, axial_train_loader = train_loaders
-    
+torch.set_float32_matmul_precision("high")
+
+
+def safe_confusion_counts(y_true, y_pred):
+    rounded_preds = np.array(y_pred).round()
+    if len(np.unique(y_true)) < 2:
+        return "n/a (single class observed in sampled labels)"
+
+    confusion = metrics.confusion_matrix(y_true, rounded_preds, labels=[0, 1])
+    if confusion.size != 4:
+        return "n/a (confusion matrix shape mismatch)"
+
+    tn, fp, fn, tp = confusion.ravel()
+    return f"tn={tn} fp={fp} fn={fn} tp={tp}"
+
+
+def maybe_sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def build_dataloader(dataset, shuffle, args):
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": shuffle,
+        "num_workers": args.num_workers,
+        "drop_last": False,
+    }
+
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+
+    if torch.cuda.is_available():
+        loader_kwargs["pin_memory"] = True
+
+    return torch.utils.data.DataLoader(dataset, **loader_kwargs)
+
+
+def prepare_inputs(volumes, device, args):
+    channels_last = bool(args.channels_last)
+    sagittal, coronal, axial = (
+        utils.prepare_volume_batch(
+            volume,
+            device=device,
+            image_size=args.image_size,
+            channels_last=channels_last,
+        )
+        for volume in volumes
+    )
+    return sagittal, coronal, axial
+
+
+def compute_auc(y_true, y_pred):
+    try:
+        if len(np.unique(y_true)) > 1:
+            return metrics.roc_auc_score(y_true, y_pred)
+    except ValueError:
+        pass
+    return 0.5
+
+
+def iterate_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    writer,
+    epoch,
+    num_epochs,
+    current_lr,
+    device,
+    args,
+    is_train,
+    global_step,
+):
+    if is_train:
+        model.train()
+    else:
+        model.eval()
+
     y_preds = []
     y_trues = []
     losses = []
+    phase = "Train" if is_train else "Val"
+    max_batches = args.max_train_batches if is_train else args.max_val_batches
+    amp_context = utils.get_amp_context(device, enabled=bool(args.amp))
 
-    for i, ((sagittal_image, label, weight), (coronal_image, _ ,_), (axial_image, _ ,_))  in enumerate(zip(sagittal_train_loader, coronal_train_loader, axial_train_loader)):
-        optimizer.zero_grad()
+    iterator = enumerate(loader)
+    for batch_index, (volumes, label, _, _) in iterator:
+        if max_batches is not None and batch_index >= max_batches:
+            break
 
-        sagittal_image = sagittal_image.to(device)
-        coronal_image = coronal_image.to(device)
-        axial_image = axial_image.to(device)
-        label = label.to(device)
-        weight = weight.to(device)
+        label = label.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
+        sagittal, coronal, axial = prepare_inputs(volumes, device, args)
 
-        sagittal_image = utils.normalize(sagittal_image / 255.0, device)
-        coronal_image = utils.normalize(coronal_image / 255.0, device)
-        axial_image = utils.normalize(axial_image / 255.0, device)
-        prediction = model.forward(sagittal_image, coronal_image, axial_image)
-        loss = nn.BCEWithLogitsLoss(weight=weight)(prediction, label)
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        with torch.set_grad_enabled(is_train):
+            with amp_context:
+                prediction = model(sagittal, coronal, axial)
+                loss = criterion(prediction, label)
 
-        loss_value = loss.item()
-        losses.append(loss_value)
+            if is_train:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-        probas = torch.sigmoid(prediction)
+        probas = torch.sigmoid(prediction).detach().cpu().numpy().reshape(-1)
+        truth = label.detach().cpu().numpy().reshape(-1)
 
-        y_trues.append(int(label[0][0]))
-        y_trues.append(int(label[0][1]))
-        y_trues.append(int(label[0][2]))
+        y_preds.extend(probas.tolist())
+        y_trues.extend(truth.astype(int).tolist())
+        losses.append(loss.item())
+        auc = compute_auc(y_trues, y_preds)
 
-        y_preds.append(probas[0][0].item())
-        y_preds.append(probas[0][1].item())
-        y_preds.append(probas[0][2].item())
+        writer.add_scalar(f"{phase}/Loss", loss.item(), global_step)
+        writer.add_scalar(f"{phase}/AUC", auc, global_step)
 
-        try:
-            if len(np.unique(y_trues)) > 1:
-                auc = metrics.roc_auc_score(y_trues, y_preds)
-            else:
-                auc = 0.5
-        except:
-            auc = 0.5
+        if batch_index > 0 and batch_index % args.log_every == 0:
+            print(
+                f"[Epoch: {epoch + 1} / {num_epochs} | batch: {batch_index} / {len(loader)}] "
+                f"| avg {phase.lower()} loss {np.mean(losses):.4f} "
+                f"| {phase.lower()} auc: {auc:.4f} | lr: {current_lr:.6g}"
+            )
 
-        writer.add_scalar('Train/Loss', loss_value, epoch * len(sagittal_train_loader) + i)
-        writer.add_scalar('Train/AUC', auc, epoch * len(sagittal_train_loader) + i)
+        global_step += 1
 
-        if (i % log_every == 0) & (i > 0):
-            print('''[Epoch: {0} / {1} |Single batch number : {2} / {3} ]| avg train loss {4} | train auc : {5} | lr : {6}'''.
-                  format(
-                      epoch + 1,
-                      num_epochs,
-                      i,
-                      len(sagittal_train_loader),
-                      np.round(np.mean(losses), 4),
-                      np.round(auc, 4),
-                      current_lr
-                  )
-                  )
-
-        writer.add_scalar('Train/AUC_epoch', auc, epoch + i)
-
-    train_loss_epoch = np.round(np.mean(losses), 4)
-    train_auc_epoch = np.round(auc, 4)
-    return train_loss_epoch, train_auc_epoch, y_trues, y_preds
+    epoch_loss = float(np.mean(losses)) if losses else float("nan")
+    epoch_auc = compute_auc(y_trues, y_preds) if y_preds else float("nan")
+    return epoch_loss, epoch_auc, y_trues, y_preds, global_step
 
 
-def evaluate_model(model, val_loaders, epoch, num_epochs, writer, current_lr, device, log_every=20):
-    _ = model.eval()
-    model.to(device)
+def build_model(args):
+    if args.model_type == "advanced":
+        model = advanced_vit.AdvancedMRNetViT(
+            num_classes=3,
+            model_name=args.vit_model,
+            pretrained=bool(args.pretrained),
+        )
+    elif args.model_type == "multiscale":
+        model = advanced_vit.MultiScaleMRNetViT(
+            num_classes=3,
+            pretrained=bool(args.pretrained),
+        )
+    else:
+        backbone_name = "resnet18" if args.model_type == "basic" else args.model_type
+        model = lightweight_models.FastMRNet(
+            backbone_name=backbone_name,
+            num_classes=3,
+            pretrained=bool(args.pretrained),
+            dropout=args.dropout,
+        )
 
-    sagittal_validation_loader, coronal_validation_loader, axial_validation_loader = val_loaders
-
-    y_trues = []
-    y_preds = []
-    losses = []
-
-    for i, ((sagittal_image, label, weight), (coronal_image, _ ,_), (axial_image, _ ,_)) in enumerate(zip(sagittal_validation_loader, coronal_validation_loader, axial_validation_loader)):
-
-        sagittal_image = sagittal_image.to(device)
-        coronal_image = coronal_image.to(device)
-        axial_image = axial_image.to(device)
-        label = label.to(device)
-        weight = weight.to(device)
-
-        sagittal_image = utils.normalize(sagittal_image / 255.0, device)
-        coronal_image = utils.normalize(coronal_image / 255.0, device)
-        axial_image = utils.normalize(axial_image / 255.0, device)
-        prediction = model.forward(sagittal_image, coronal_image, axial_image)
-        loss = nn.BCEWithLogitsLoss(weight=weight)(prediction, label)
-
-        loss_value = loss.item()
-        losses.append(loss_value)
-
-        probas = torch.sigmoid(prediction)
-
-        y_trues.append(int(label[0][0]))
-        y_trues.append(int(label[0][1]))
-        y_trues.append(int(label[0][2]))
-
-        y_preds.append(probas[0][0].item())
-        y_preds.append(probas[0][1].item())
-        y_preds.append(probas[0][2].item())
-
-        try:
-            if len(np.unique(y_trues)) > 1:
-                auc = metrics.roc_auc_score(y_trues, y_preds)
-            else:
-                auc = 0.5
-        except:
-            auc = 0.5
-
-        writer.add_scalar('Val/Loss', loss_value, epoch * len(sagittal_validation_loader) + i)
-        writer.add_scalar('Val/AUC', auc, epoch * len(sagittal_validation_loader) + i)
-
-        if (i % log_every == 0) & (i > 0):
-            print('''[Epoch: {0} / {1} |Single batch number : {2} / {3} ] | avg val loss {4} | val auc : {5} | lr : {6}'''.
-                  format(
-                      epoch + 1,
-                      num_epochs,
-                      i,
-                      len(sagittal_validation_loader),
-                      np.round(np.mean(losses), 4),
-                      np.round(auc, 4),
-                      current_lr
-                  )
-                  )
-
-        writer.add_scalar('Val/AUC_epoch', auc, epoch + i)
-
-    val_loss_epoch = np.round(np.mean(losses), 4)
-    val_auc_epoch = np.round(auc, 4)
-    return val_loss_epoch, val_auc_epoch, y_trues, y_preds
+    return model
 
 
 def run(args):
-    # Determine device
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS device.")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using CUDA device.")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU device.")
+    if args.batch_size != 1:
+        raise ValueError("MRNet training currently expects --batch_size 1 because slice counts vary by exam.")
 
-    log_root_folder = "./logs/{0}/{1}/".format(args.task, args.plane)
+    device = utils.get_device()
+    print(f"Using device: {device.type}")
+
+    log_root_folder = f"./logs/{args.task}/{args.plane}/"
+    os.makedirs(log_root_folder, exist_ok=True)
+
     if args.flush_history == 1:
-        objects = os.listdir(log_root_folder)
-        for f in objects:
-            if os.path.isdir(log_root_folder + f):
-                shutil.rmtree(log_root_folder + f)
+        for item in os.listdir(log_root_folder):
+            item_path = os.path.join(log_root_folder, item)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
 
     now = datetime.now()
-    logdir = log_root_folder + now.strftime("%Y%m%d-%H%M%S") + "/"
+    run_name = args.prefix_name or now.strftime("%Y%m%d-%H%M%S")
+    logdir = os.path.join(log_root_folder, now.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(logdir, exist_ok=True)
-
     writer = SummaryWriter(logdir)
 
-    augmentor = transforms.Compose([
-        transforms.Lambda(utils.convert_to_tensor),
-        transforms.Resize((224, 224)),
-        transforms.RandomAffine(degrees=25, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-        transforms.RandomHorizontalFlip(),
-        transforms.Lambda(utils.repeat_and_permute),
-    ])
+    data_root = args.data_root.rstrip("/") + "/"
+    train_dataset = MRMultiPlaneDataset(
+        data_root,
+        train=True,
+        mmap=bool(args.mmap),
+        cache_size=args.cache_size,
+    )
+    val_dataset = MRMultiPlaneDataset(
+        data_root,
+        train=False,
+        mmap=bool(args.mmap),
+        cache_size=max(1, args.cache_size // 2),
+    )
 
-    val_augmentor = transforms.Compose([
-        transforms.Lambda(utils.convert_to_tensor),
-        transforms.Resize((224, 224)),
-        transforms.Lambda(utils.repeat_and_permute),
-    ])
+    train_loader = build_dataloader(train_dataset, shuffle=True, args=args)
+    val_loader = build_dataloader(val_dataset, shuffle=False, args=args)
 
-    sagittal_train_dataset = MRDataset('MRNet-v1.0/', 'sagittal', transform=augmentor, train=True)
-    coronal_train_dataset = MRDataset('MRNet-v1.0/', 'coronal', transform=augmentor, train=True)
-    axial_train_dataset = MRDataset('MRNet-v1.0/', 'axial', transform=augmentor, train=True)
+    model = build_model(args)
+    model = utils.maybe_channels_last(model, device)
+    model.to(device)
 
-    sagittal_train_loader = torch.utils.data.DataLoader(sagittal_train_dataset, batch_size=1, shuffle=True, num_workers=1, drop_last=False)
-    coronal_train_loader = torch.utils.data.DataLoader(coronal_train_dataset, batch_size=1, shuffle=True, num_workers=1, drop_last=False)
-    axial_train_loader = torch.utils.data.DataLoader(axial_train_dataset, batch_size=1, shuffle=True, num_workers=1, drop_last=False)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        patience=3,
+        factor=0.3,
+        threshold=1e-4,
+    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=train_dataset.weights.to(device))
 
-    sagittal_validation_dataset = MRDataset( 'MRNet-v1.0/', 'sagittal', transform=val_augmentor, train=False)
-    coronal_validation_dataset = MRDataset( 'MRNet-v1.0/',  'coronal', transform=val_augmentor, train=False)
-    axial_validation_dataset = MRDataset( 'MRNet-v1.0/', 'axial', transform=val_augmentor, train=False)
-
-    sagittal_validation_loader = torch.utils.data.DataLoader(sagittal_validation_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False)
-    coronal_validation_loader = torch.utils.data.DataLoader(coronal_validation_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False)
-    axial_validation_loader = torch.utils.data.DataLoader(axial_validation_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False)
-
-    train_loaders = (sagittal_train_loader, coronal_train_loader, axial_train_loader)
-    val_loaders = (sagittal_validation_loader, coronal_validation_loader, axial_validation_loader)
-
-    mrnet = vit.MRNetViT()
-    mrnet.to(device)
-
-    optimizer = optim.Adam(mrnet.parameters(), lr=args.lr, weight_decay=0)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=.3, threshold=1e-4)
-
-    best_val_loss = float('inf')
-    best_val_auc = float(0)
+    best_val_loss = float("inf")
+    best_val_auc = 0.0
+    best_epoch = -1
+    patience_counter = 0
+    global_train_step = 0
+    global_val_step = 0
 
     num_epochs = args.epochs
-    iteration_change_loss = 0
     patience = args.patience
-    log_every = args.log_every
-
     t_start_training = time.time()
+    avg_epoch_seconds = []
 
     for epoch in range(num_epochs):
-        current_lr = utils.get_lr(optimizer)
-        t_start = time.time()
+        elapsed_minutes = (time.time() - t_start_training) / 60.0
+        if args.time_budget_minutes is not None and elapsed_minutes >= args.time_budget_minutes:
+            print(f"Stopping early after reaching the {args.time_budget_minutes:.2f} minute budget.")
+            break
 
-        train_loss, train_auc, train_y_trues, train_y_preds = train_model(
-            mrnet, train_loaders, epoch, num_epochs, optimizer, writer, current_lr, device, log_every)
-        
-        val_loss, val_auc, val_y_trues, val_y_preds = evaluate_model(
-            mrnet, val_loaders, epoch, num_epochs, writer, current_lr, device)
+        current_lr = utils.get_lr(optimizer)
+        maybe_sync(device)
+        t_start_epoch = time.time()
+
+        train_loss, train_auc, train_y_trues, train_y_preds, global_train_step = iterate_epoch(
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            writer=writer,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            current_lr=current_lr,
+            device=device,
+            args=args,
+            is_train=True,
+            global_step=global_train_step,
+        )
+
+        val_loss, val_auc, val_y_trues, val_y_preds, global_val_step = iterate_epoch(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            writer=writer,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            current_lr=current_lr,
+            device=device,
+            args=args,
+            is_train=False,
+            global_step=global_val_step,
+        )
 
         scheduler.step(val_loss)
 
-        t_end = time.time()
-        delta = t_end - t_start
+        maybe_sync(device)
+        epoch_seconds = time.time() - t_start_epoch
+        avg_epoch_seconds.append(epoch_seconds)
 
-        train_true_negatives, train_false_positives, train_false_negatives, train_true_positives = metrics.confusion_matrix(train_y_trues, np.array(train_y_preds).round()).ravel()
-        val_true_negatives, val_false_positives, val_false_negatives, val_true_positives = metrics.confusion_matrix(val_y_trues, np.array(val_y_preds).round()).ravel()
-
-        print("train loss : {0} | train auc {1} | val loss {2} | val auc {3} | elapsed time {4} s".format(
-            train_loss, train_auc, val_loss, val_auc, delta))
-
-        print("train_true_negatives :{0} | train_false_positives {1} | train_false_negatives {2} | train_true_positives {3}".format(
-            train_true_negatives, train_false_positives, train_false_negatives, train_true_positives))
-
-        print("val_true_negatives :{0} | val_false_positives {1} | val_false_negatives {2} | val_true_positives {3}".format(
-            val_true_negatives, val_false_positives, val_false_negatives, val_true_positives))
-
-        iteration_change_loss += 1
-        print('-' * 30)
+        print(
+            f"train loss: {train_loss:.4f} | train auc: {train_auc:.4f} "
+            f"| val loss: {val_loss:.4f} | val auc: {val_auc:.4f} "
+            f"| elapsed time: {epoch_seconds:.2f} s"
+        )
+        print("train confusion:", safe_confusion_counts(train_y_trues, train_y_preds))
+        print("val confusion:", safe_confusion_counts(val_y_trues, val_y_preds))
+        print("-" * 30)
 
         if val_auc > best_val_auc:
-            best_val_auc = val_auc
+            best_val_auc = float(val_auc)
+            best_epoch = epoch + 1
             if bool(args.save_model):
-                file_name = f'model_{args.prefix_name}_{args.task}_{args.plane}_val_auc_{val_auc:0.4f}_train_auc_{train_auc:0.4f}_epoch_{epoch+1}.pth'
-                # Ensure models directory exists
-                os.makedirs('models', exist_ok=True)
-                for f in os.listdir('models/'):
-                    if (args.task in f) and (args.plane in f) and (args.prefix_name in f):
-                        os.remove(f'models/{f}')
-                torch.save(mrnet, f'models/{file_name}')
+                os.makedirs("models", exist_ok=True)
+                file_name = (
+                    f"model_{run_name}_{args.model_type}_val_auc_{val_auc:0.4f}_"
+                    f"train_auc_{train_auc:0.4f}_epoch_{epoch + 1}.pth"
+                )
+                for existing_file in os.listdir("models"):
+                    if run_name in existing_file:
+                        os.remove(os.path.join("models", existing_file))
+                torch.save(model.state_dict(), os.path.join("models", file_name))
+                print(f"Best model saved with validation AUC: {val_auc:.4f}")
 
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            iteration_change_loss = 0
+            best_val_loss = float(val_loss)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(
+                    f"Early stopping after {patience_counter} epochs without validation loss improvement."
+                )
+                break
 
-        if iteration_change_loss == patience:
-            print('Early stopping after {0} iterations without the decrease of the val loss'.
-                  format(iteration_change_loss))
-            break
+    maybe_sync(device)
+    training_seconds = time.time() - t_start_training
+    writer.close()
 
-    t_end_training = time.time()
-    print(f'training took {t_end_training - t_start_training} s')
+    num_params = sum(parameter.numel() for parameter in model.parameters())
+    avg_epoch_time = float(np.mean(avg_epoch_seconds)) if avg_epoch_seconds else float("nan")
+
+    print("---")
+    print(f"best_val_auc:       {best_val_auc:.6f}")
+    print(f"best_val_loss:      {best_val_loss:.6f}")
+    print(f"training_seconds:   {training_seconds:.2f}")
+    print(f"avg_epoch_seconds:  {avg_epoch_time:.2f}")
+    print(f"epochs_ran:         {len(avg_epoch_seconds)}")
+    print(f"best_epoch:         {best_epoch}")
+    print(f"num_params_M:       {num_params / 1e6:.2f}")
+    print(f"model_type:         {args.model_type}")
+    print(f"device:             {device.type}")
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-t', '--task', type=str,
-                        choices=['abnormal', 'acl', 'meniscus'], default = 'acl')
-    parser.add_argument('-p', '--plane', type=str,
-			choices=['Segittal_Coronal_and_Axial'], default = 'Segittal_Coronal_and_Axial')
-    parser.add_argument('--lr_scheduler', type=str,
-                        default='plateau', choices=['plateau', 'step'])
-    parser.add_argument('--prefix_name', type=str, required=True)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--flush_history', type=int, choices=[0, 1], default=0)
-    parser.add_argument('--save_model', type=int, choices=[0, 1], default=1)
-    parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--log_every', type=int, default=100)
-    args = parser.parse_args()
-    return args
+    parser.add_argument(
+        "-t",
+        "--task",
+        type=str,
+        choices=["abnormal", "acl", "meniscus"],
+        default="acl",
+    )
+    parser.add_argument(
+        "-p",
+        "--plane",
+        type=str,
+        choices=["Segittal_Coronal_and_Axial"],
+        default="Segittal_Coronal_and_Axial",
+    )
+    parser.add_argument("--prefix_name", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--flush_history", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--save_model", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--log_every", type=int, default=25)
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="resnet18",
+        choices=[
+            "basic",
+            "advanced",
+            "multiscale",
+            "resnet18",
+            "mobilenet_v3_small",
+            "efficientnet_b0",
+        ],
+        help="Model family to use. Lighter CNNs are much faster than the ViT variants.",
+    )
+    parser.add_argument(
+        "--vit_model",
+        type=str,
+        default="vit_b_16",
+        choices=["vit_b_16", "vit_l_16", "vit_h_14"],
+        help="Only used when model_type=advanced.",
+    )
+    parser.add_argument(
+        "--pretrained",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Use ImageNet pretrained weights.",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="MRNet-v1.0",
+        help="Path to the MRNet dataset root folder.",
+    )
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--cache_size", type=int, default=32)
+    parser.add_argument("--mmap", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--amp", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--channels_last", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--max_train_batches", type=int, default=None)
+    parser.add_argument("--max_val_batches", type=int, default=None)
+    parser.add_argument(
+        "--time_budget_minutes",
+        type=float,
+        default=None,
+        help="Optional wall-clock budget for experiment runs.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_arguments()
-    run(args)
+    run(parse_arguments())

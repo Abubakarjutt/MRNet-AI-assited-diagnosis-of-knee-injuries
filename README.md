@@ -4,28 +4,15 @@ This repository contains an implementation of the research paper [MRNet: Deep-le
 
 ## Project Overview
 
-This project introduces an advanced deep learning model for diagnosing knee injuries from Magnetic Resonance Imaging (MRI) scans. It builds upon the foundational research of the [original MRNet paper](https://stanfordmlgroup.github.io/projects/mrnet/) but introduces a key architectural enhancement: a **Vision Transformer (ViT)**.
-
-Instead of training separate models for each MRI plane (sagittal, coronal, and axial), this implementation uses a **single, end-to-end model** that processes all three planes simultaneously. This ViT-based approach not only streamlines the training process but also achieves high diagnostic accuracy for multiple conditions, including abnormalities, ACL tears, and meniscus tears. This updated architecture represents a significant step forward, reducing training time by approximately 5x while maintaining robust performance.
-
-## Model Architecture
-
-The model uses a Vision Transformer (ViT) pretrained on the ImageNet dataset (*ViT-B/16*). The architecture is designed to handle the multi-plane nature of MRI data effectively:
-
-1.  **Input Processing**: The model takes three MRI series as input: sagittal, coronal, and axial. Each series consists of multiple slices.
-2.  **Feature Extraction**: The pretrained ViT backbone extracts features from every slice of all three planes.
-3.  **Aggregation**: A max-pooling layer aggregates the slice-level features across all planes to create a single feature vector that represents the entire MRI exam.
-4.  **Classification**: A final linear layer with dropout classifies the aggregated features to predict the probabilities for the three diagnostic labels (abnormal, ACL tear, meniscus tear).
-
-While the primary model is ViT-based, the repository also includes implementations for `AlexNet` and `ResNet` as alternative architectures.
+This project trains a single end-to-end model over all three MRI planes instead of training separate models per plane. The current codebase now supports both the original heavier transformer-style path and a faster autoresearch-oriented path built around lighter shared encoders, short experiment budgets, and Apple Silicon friendly preprocessing.
 
 ## Dataset: MRNet
 
 The data comes from the Stanford ML Group research lab. It consists of 1,370 knee MRI exams performed at Stanford University Medical Center to study the presence of Anterior Cruciate Ligament (ACL) tears and Meniscus tears.
 
-*   **Input**: Multi-view MRI scans (Sagittal, Coronal, Axial).
-*   **Task**: Multi-label, multi-class classification.
-*   **Labels**: Abnormal, ACL tear, Meniscus tear.
+- **Input**: Multi-view MRI scans (Sagittal, Coronal, Axial).
+- **Task**: Multi-label, multi-class classification.
+- **Labels**: Abnormal, ACL tear, Meniscus tear.
 
 You can request the dataset from [this link](https://stanfordmlgroup.github.io/competitions/mrnet/).
 
@@ -33,89 +20,145 @@ You can request the dataset from [this link](https://stanfordmlgroup.github.io/c
 
 ### Prerequisites
 
-*   **Python**: 3.11+
-*   **PyTorch**: Ensure you have a version of PyTorch compatible with your hardware (e.g., CUDA for NVIDIA GPUs, MPS for Apple Silicon).
+- Python 3.11+
+- PyTorch compatible with your hardware, including MPS for Apple Silicon if available
 
 ### Installation
 
-1.  **Clone the Repository**:
-    ```bash
-    git clone https://github.com/your-repo/mrnet.git
-    cd mrnet
-    ```
-
-2.  **Install Dependencies**:
-    It is recommended to use a virtual environment to manage dependencies.
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
-    pip install -r requirements.txt
-    ```
+```bash
+git clone https://github.com/your-repo/mrnet.git
+cd mrnet
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
 ### Directory Structure
 
-Ensure your project is structured as follows:
-
-```
+```text
 .
-├── MRNet-v1.0/              # Dataset directory
-│   ├── train/
-│   ├── valid/
-│   └── ...
-├── models/                  # Directory for saved model checkpoints
-├── logs/                    # Directory for Tensorboard logs
-├── train.py                 # Main training script
-├── dataloader.py            # Data loading logic
-├── vit.py                   # Vision Transformer model
-├── resnet.py                # ResNet model (alternative)
-├── alexnet.py               # AlexNet model (alternative)
-├── utils.py                 # Helper functions
-├── requirements.txt         # Project dependencies
+├── MRNet-v1.0/
+├── models/
+├── logs/
+├── train.py
+├── dataloader.py
+├── advanced_vit.py
+├── lightweight_models.py
+├── experiment_runner.py
+├── experiment_configs.py
 └── README.md
 ```
 
 ## Usage
 
-To train the model, use the `train.py` script.
+`train.py` is the canonical training entrypoint in this workspace.
 
 ### Basic Usage
 
-A typical training command looks like this:
-
 ```bash
-python train.py --prefix_name "vit_experiment_1" --epochs 50 --lr 1e-5
+python train.py --prefix_name my_experiment --model_type resnet18
 ```
 
 ### Command-Line Arguments
 
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `--prefix_name` | **Required**. A unique name for the experiment, used for saving models and logs. | N/A |
-| `--task` | The diagnostic task. Since the model is multi-label, this is primarily for organizing logs. | `acl` |
-| `--epochs` | The total number of training epochs. | `50` |
-| `--lr` | The initial learning rate for the Adam optimizer. | `1e-5` |
-| `--patience` | Number of epochs with no improvement in validation loss before early stopping. | `20` |
-| `--save_model` | Set to `1` to save the best model based on validation AUC. Set to `0` to disable. | `1` |
-| `--flush_history` | Set to `1` to delete previous logs for the same task before starting a new run. | `0` |
-| `--log_every` | The frequency (in batches) of logging training progress. | `100` |
+| `--prefix_name` | Required experiment prefix used for logs and model names. | N/A |
+| `--task` | Task name used for logging. | `acl` |
+| `--plane` | Plane configuration label. | `Segittal_Coronal_and_Axial` |
+| `--epochs` | Number of training epochs. | `30` |
+| `--lr` | Learning rate. | `3e-4` |
+| `--patience` | Early stopping patience. | `8` |
+| `--save_model` | Save best checkpoint. | `1` |
+| `--flush_history` | Clear previous logs. | `0` |
+| `--log_every` | Logging interval in batches. | `25` |
+| `--data_root` | Path to dataset root. | `MRNet-v1.0` |
+| `--num_workers` | DataLoader workers. | `2` |
+| `--model_type` | Includes `resnet18`, `mobilenet_v3_small`, `efficientnet_b0`, `advanced`, and `multiscale`. | `resnet18` |
+| `--time_budget_minutes` | Optional wall-clock budget for experiment runs. | unset |
+| `--max_train_batches` | Optional cap for train batches. | unset |
+| `--max_val_batches` | Optional cap for validation batches. | unset |
 
 ### Example
 
-Train a model for 100 epochs with a specific learning rate and a custom prefix:
+```bash
+python train.py --prefix_name r18_trial --model_type resnet18
+python train.py --prefix_name mobile_trial --model_type mobilenet_v3_small
+python train.py --prefix_name vit_trial --model_type advanced --vit_model vit_b_16
+```
+
+### Quick Smoke Test
 
 ```bash
-python train.py --prefix_name "MRNet_ViT_Run1" --epochs 100 --lr 0.0001
+python train.py \
+  --prefix_name smoke_test \
+  --epochs 1 \
+  --pretrained 0 \
+  --save_model 0 \
+  --max_train_batches 2 \
+  --max_val_batches 2
 ```
+
+## Faster Training Path
+
+The faster MRNet path is aimed at short automatic experiments and Apple Silicon:
+
+- A single exam-level dataset keeps sagittal, coronal, and axial scans synchronized.
+- `.npy` volumes are memory-mapped and optionally cached.
+- Resize and normalization happen in one batched operation on the device.
+- Lightweight pretrained backbones are available through `train.py`.
+
+Recommended first runs:
+
+```bash
+python train.py --prefix_name r18_trial --model_type resnet18
+python train.py --prefix_name mobile_trial --model_type mobilenet_v3_small
+python train.py --prefix_name effb0_trial --model_type efficientnet_b0
+```
+
+## Autoresearch-Style Loop
+
+An experiment harness inspired by Karpathy's `autoresearch` is available:
+
+```bash
+python experiment_runner.py --group short --run_tag mrnet_mps
+```
+
+Edit `experiment_configs.py` to change the search queue, and read `program.md` for the intended workflow. Results are appended to `results.tsv`, with per-run logs written to `experiment_logs/`.
+
+Available experiment groups:
+
+- `short`: default 5-minute automatic experiments
+- `full`: longer 20-minute comparison runs
+- `all`: both groups in sequence
+
+Example with runtime overrides:
+
+```bash
+python experiment_runner.py --group short --set data_root=/absolute/path/to/MRNet-v1.0 num_workers=4
+```
+
+## GitHub Actions
+
+A GitHub Actions workflow is included at `.github/workflows/mrnet-autoresearch.yml`.
+
+This is designed for a self-hosted Apple Silicon runner because:
+
+- the MRNet dataset is local and not available on GitHub-hosted runners
+- Apple MPS is only available on your Mac, not on standard hosted runners
+
+Suggested setup:
+
+1. Register your Mac as a self-hosted Actions runner with labels `self-hosted`, `macOS`, and `ARM64`.
+2. Set the repository variable `MRNET_DATA_ROOT` to the local dataset path on that runner.
+3. Trigger the workflow manually from Actions, or use the built-in nightly schedule.
+
+The workflow uploads `ci_results/` and `experiment_logs/` as artifacts after each run.
 
 ## Results
 
-The model's performance is evaluated using the Area Under the Receiver Operating Characteristic Curve (AUC), a standard metric for binary and multi-label classification tasks. The ViT-based model demonstrates strong performance, comparable to the original MRNet paper, with the advantage of an end-to-end training pipeline.
-
-*   **Validation AUC**: The model typically achieves a validation AUC of approximately **0.915**.
-*   **Training AUC**: The training AUC reaches around **0.99**, indicating that the model fits the training data well.
-
-These results confirm the effectiveness of the Vision Transformer architecture for this diagnostic task.
+The model is evaluated primarily with validation AUC. The compact shared-encoder path is intended to trade a small amount of peak accuracy for much faster iteration, which makes it a better fit for automatic experimentation on a Mac.
 
 ## Contributions
 
-Contributions are welcome! If you feel that some functionalities or improvements could be added to the project, don't hesitate to submit a pull request.
+Contributions are welcome. If you have ideas for model improvements, data pipeline optimizations, or better experiment strategies, feel free to open a pull request.
