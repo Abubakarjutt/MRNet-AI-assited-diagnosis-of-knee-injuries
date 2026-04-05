@@ -44,6 +44,7 @@ pip install -r requirements.txt
 ├── dataloader.py
 ├── advanced_vit.py
 ├── lightweight_models.py
+├── autoresearch_loop.py
 ├── experiment_runner.py
 ├── experiment_configs.py
 └── README.md
@@ -118,25 +119,32 @@ python train.py --prefix_name effb0_trial --model_type efficientnet_b0
 
 ## Autoresearch-Style Loop
 
-An experiment harness inspired by Karpathy's `autoresearch` is available:
+The main autoresearch path is now:
 
 ```bash
-python experiment_runner.py --group short --run_tag mrnet_mps
+python3 autoresearch_loop.py --iterations 3 --data_root MRNet-v1.0
 ```
 
-Edit `experiment_configs.py` to change the search queue, and read `program.md` for the intended workflow. Results are appended to `results.tsv`, with per-run logs written to `experiment_logs/`.
+This loop is persistent and architecture-improving:
 
-Available experiment groups:
+- it loads the current best config from `~/.mrnet_autoresearch`
+- mutates a few architecture and training knobs
+- runs a short experiment
+- promotes only better candidates
 
-- `short`: default 5-minute automatic experiments
-- `full`: longer 20-minute comparison runs
-- `all`: both groups in sequence
-
-Example with runtime overrides:
+The best architecture is persisted in:
 
 ```bash
-python experiment_runner.py --group short --set data_root=/absolute/path/to/MRNet-v1.0 num_workers=4
+~/.mrnet_autoresearch/best_config.json
 ```
+
+The full run history is persisted in:
+
+```bash
+~/.mrnet_autoresearch/results.tsv
+```
+
+`experiment_runner.py` still exists for fixed preset batches, but `autoresearch_loop.py` is the continuous-improvement path.
 
 ## GitHub Actions
 
@@ -153,7 +161,13 @@ Suggested setup:
 2. Set the repository variable `MRNET_DATA_ROOT` to the local dataset path on that runner.
 3. Trigger the workflow manually from Actions, or use the built-in nightly schedule.
 
-The workflow uploads `ci_results/` and `experiment_logs/` as artifacts after each run.
+The workflow uploads:
+
+- `ci_results/summary.md`
+- `ci_results/results.tsv`
+- `ci_results/best_config.json`
+
+and it reuses the same persistent state directory on the self-hosted runner so future scheduled runs continue from the latest best architecture instead of restarting.
 
 ## Results
 

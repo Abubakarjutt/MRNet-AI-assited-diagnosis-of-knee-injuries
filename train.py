@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import time
@@ -184,9 +185,27 @@ def build_model(args):
             num_classes=3,
             pretrained=bool(args.pretrained),
             dropout=args.dropout,
+            pooling=args.pooling,
+            projection_dim=args.projection_dim,
+            hidden_dim=args.hidden_dim,
+            fusion_depth=args.fusion_depth,
         )
 
     return model
+
+
+def maybe_load_search_config(args):
+    if not args.search_config:
+        return args
+
+    with open(args.search_config, "r") as handle:
+        config = json.load(handle)
+
+    for key, value in config.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+
+    return args
 
 
 def run(args):
@@ -374,6 +393,16 @@ def parse_arguments():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--projection_dim", type=int, default=0)
+    parser.add_argument("--fusion_depth", type=int, default=2)
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default="max",
+        choices=["max", "mean", "lse"],
+        help="Slice aggregation strategy for the lightweight searchable models.",
+    )
     parser.add_argument("--flush_history", type=int, choices=[0, 1], default=0)
     parser.add_argument("--save_model", type=int, choices=[0, 1], default=1)
     parser.add_argument("--patience", type=int, default=8)
@@ -428,8 +457,16 @@ def parse_arguments():
         default=None,
         help="Optional wall-clock budget for experiment runs.",
     )
+    parser.add_argument(
+        "--search_config",
+        type=str,
+        default=None,
+        help="Optional JSON file containing an autoresearch-selected model/training configuration.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run(parse_arguments())
+    parsed_args = parse_arguments()
+    maybe_load_search_config(parsed_args)
+    run(parsed_args)
