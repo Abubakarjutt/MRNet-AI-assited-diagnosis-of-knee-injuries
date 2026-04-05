@@ -38,7 +38,7 @@ def prepare_volume_batch(volume, device, image_size=224, channels_last=False):
         volume = volume.unsqueeze(0)
 
     volume = volume.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
-    volume = volume.div_(255.0).unsqueeze(2).expand(-1, -1, 3, -1, -1)
+    volume = volume.div_(255.0).unsqueeze(2).repeat(1, 1, 3, 1, 1).contiguous()
     batch_size, slices, channels, height, width = volume.shape
     flat = volume.reshape(batch_size * slices, channels, height, width)
     flat = F.interpolate(
