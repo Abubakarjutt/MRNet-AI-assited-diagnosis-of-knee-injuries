@@ -123,7 +123,7 @@ class FastMRNet(nn.Module):
             [plane.reshape(-1, *plane.shape[-3:]) for plane in plane_tensors],
             dim=0,
         )
-        if flat_inputs.device.type in {"cuda", "mps"}:
+        if flat_inputs.device.type == "cuda":
             flat_inputs = flat_inputs.contiguous(memory_format=torch.channels_last)
         encoded = self.encoder(flat_inputs)
 

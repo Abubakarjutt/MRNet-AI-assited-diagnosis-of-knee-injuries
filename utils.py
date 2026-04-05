@@ -22,13 +22,13 @@ def get_device():
 
 
 def get_amp_context(device, enabled=True):
-    if not enabled or device.type not in {"cuda", "mps"}:
+    if not enabled or device.type != "cuda":
         return contextlib.nullcontext()
     return torch.autocast(device_type=device.type, dtype=torch.float16)
 
 
 def maybe_channels_last(module, device):
-    if device.type in {"cuda", "mps"}:
+    if device.type == "cuda":
         module.to(memory_format=torch.channels_last)
     return module
 
