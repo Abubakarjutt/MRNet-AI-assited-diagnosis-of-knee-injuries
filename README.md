@@ -122,14 +122,14 @@ python train.py --prefix_name effb0_trial --model_type efficientnet_b0
 The main autoresearch path is now:
 
 ```bash
-python3 autoresearch_loop.py --iterations 3 --data_root MRNet-v1.0
+python3 autoresearch_loop.py --iterations 1 --data_root MRNet-v1.0
 ```
 
 This loop is persistent and architecture-improving:
 
 - it loads the current best config from `~/.mrnet_autoresearch`
 - mutates a few architecture and training knobs
-- runs a short experiment
+- runs a fixed-budget experiment
 - promotes only better candidates
 
 The best architecture is persisted in:
@@ -145,6 +145,8 @@ The full run history is persisted in:
 ```
 
 `experiment_runner.py` still exists for fixed preset batches, but `autoresearch_loop.py` is the continuous-improvement path.
+
+Default per-candidate budget: `60` minutes.
 
 ## GitHub Actions
 

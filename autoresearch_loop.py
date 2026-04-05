@@ -66,7 +66,7 @@ DEFAULT_CONFIG = {
     "patience": 3,
     "amp": 1,
     "channels_last": 1,
-    "time_budget_minutes": 5,
+    "time_budget_minutes": 60,
     "pretrained": 0,
     "mmap": 1,
     "save_model": 0,

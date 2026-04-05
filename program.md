@@ -4,13 +4,13 @@ This folder now supports a true autoresearch-style improvement loop for MRNet.
 
 ## Goal
 
-Continuously improve the MRNet architecture through short experiments.
+Continuously improve the MRNet architecture through fixed-budget experiments.
 
 Each experiment should:
 
 1. Start from the current best known architecture.
 2. Mutate a small number of architecture or training knobs.
-3. Run a short training budget.
+3. Run a fixed training budget.
 4. Keep the new configuration only if validation AUC improves.
 5. Use the kept winner as the parent for the next experiment.
 
@@ -56,10 +56,10 @@ Important files there:
 
 ## Local Usage
 
-Run three short improvement iterations:
+Run one improvement iteration:
 
 ```bash
-python3 autoresearch_loop.py --iterations 3 --data_root MRNet-v1.0
+python3 autoresearch_loop.py --iterations 1 --data_root MRNet-v1.0
 ```
 
 ## GitHub Actions
@@ -72,3 +72,5 @@ Each dispatch or scheduled run:
 2. runs several short mutations
 3. promotes only improved candidates
 4. uploads the latest summary and best config as artifacts
+
+The default per-candidate budget is now 60 minutes.
