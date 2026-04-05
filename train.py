@@ -189,6 +189,7 @@ def build_model(args):
             projection_dim=args.projection_dim,
             hidden_dim=args.hidden_dim,
             fusion_depth=args.fusion_depth,
+            fusion_gate=args.fusion_gate,
         )
 
     return model
@@ -400,8 +401,15 @@ def parse_arguments():
         "--pooling",
         type=str,
         default="max",
-        choices=["max", "mean", "lse"],
+        choices=["max", "mean", "lse", "attention", "gem"],
         help="Slice aggregation strategy for the lightweight searchable models.",
+    )
+    parser.add_argument(
+        "--fusion_gate",
+        type=str,
+        default="none",
+        choices=["none", "se"],
+        help="Optional fusion recalibration block for research-driven mutations.",
     )
     parser.add_argument("--flush_history", type=int, choices=[0, 1], default=0)
     parser.add_argument("--save_model", type=int, choices=[0, 1], default=1)

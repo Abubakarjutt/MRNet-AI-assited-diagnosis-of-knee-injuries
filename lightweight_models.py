@@ -47,7 +47,58 @@ def build_backbone(name, pretrained=True):
     return _strip_classifier(backbone, name)
 
 
-def _pool_slices(slice_features, pooling):
+class AttentionMILPool(nn.Module):
+    def __init__(self, feature_dim, attention_dim=128):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(feature_dim, attention_dim),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 1),
+        )
+
+    def forward(self, slice_features):
+        logits = self.attention(slice_features)
+        weights = torch.softmax(logits, dim=1)
+        return torch.sum(weights * slice_features, dim=1)
+
+
+class GeMPool1D(nn.Module):
+    def __init__(self, p=3.0, eps=1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.tensor(float(p)))
+        self.eps = eps
+
+    def forward(self, slice_features):
+        positive = torch.clamp(torch.nn.functional.gelu(slice_features), min=self.eps)
+        pooled = positive.pow(self.p).mean(dim=1).pow(1.0 / self.p)
+        return pooled
+
+
+class SEFusionGate(nn.Module):
+    def __init__(self, fused_dim, reduction=8):
+        super().__init__()
+        hidden_dim = max(fused_dim // reduction, 32)
+        self.net = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Linear(fused_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, fused_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, fused):
+        return fused * self.net(fused)
+
+
+def build_pooler(pooling, feature_dim):
+    if pooling == "attention":
+        return AttentionMILPool(feature_dim=feature_dim)
+    if pooling == "gem":
+        return GeMPool1D()
+    return None
+
+
+def simple_pool(slice_features, pooling):
     if pooling == "max":
         return torch.amax(slice_features, dim=1)
     if pooling == "mean":
@@ -68,14 +119,17 @@ class FastMRNet(nn.Module):
         projection_dim=0,
         hidden_dim=256,
         fusion_depth=2,
+        fusion_gate="none",
     ):
         super().__init__()
         self.backbone_name = backbone_name
         self.pooling = pooling
+        self.fusion_gate_name = fusion_gate
         self.encoder, self.feature_dim = build_backbone(backbone_name, pretrained)
         self.projection_dim = projection_dim if projection_dim > 0 else self.feature_dim
         self.hidden_dim = hidden_dim
         self.fusion_depth = fusion_depth
+        self.slice_pooler = build_pooler(pooling, self.feature_dim)
 
         self.plane_projection = (
             nn.Sequential(
@@ -88,6 +142,7 @@ class FastMRNet(nn.Module):
         )
 
         fused_dim = self.projection_dim * 3
+        self.fusion_gate = SEFusionGate(fused_dim) if fusion_gate == "se" else nn.Identity()
         self.classifier = self._build_classifier(
             fused_dim=fused_dim,
             num_classes=num_classes,
@@ -117,6 +172,11 @@ class FastMRNet(nn.Module):
         layers.append(nn.Linear(in_features, num_classes))
         return nn.Sequential(*layers)
 
+    def _pool_slices(self, slice_features):
+        if self.slice_pooler is not None:
+            return self.slice_pooler(slice_features)
+        return simple_pool(slice_features, self.pooling)
+
     def _encode_planes(self, plane_tensors):
         batch_size = plane_tensors[0].shape[0]
         flat_inputs = torch.cat(
@@ -133,7 +193,7 @@ class FastMRNet(nn.Module):
             slice_count = plane.shape[1]
             plane_features = encoded[offset: offset + batch_size * slice_count]
             plane_features = plane_features.reshape(batch_size, slice_count, self.feature_dim)
-            pooled = _pool_slices(plane_features, self.pooling)
+            pooled = self._pool_slices(plane_features)
             pooled_features.append(self.plane_projection(pooled))
             offset += batch_size * slice_count
 
@@ -147,4 +207,5 @@ class FastMRNet(nn.Module):
             [sagittal_features, coronal_features, axial_features],
             dim=1,
         )
+        fused = self.fusion_gate(fused)
         return self.classifier(fused)

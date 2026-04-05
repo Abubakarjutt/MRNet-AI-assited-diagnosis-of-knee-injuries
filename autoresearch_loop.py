@@ -9,6 +9,8 @@ import sys
 from copy import deepcopy
 from datetime import datetime
 
+from research_priors import RESEARCH_PRIORS
+
 
 SUMMARY_PATTERNS = {
     "best_val_auc": re.compile(r"^best_val_auc:\s+([0-9.]+)$", re.MULTILINE),
@@ -38,10 +40,11 @@ RESULT_COLUMNS = [
 
 SEARCH_SPACE = {
     "model_type": ["resnet18", "mobilenet_v3_small", "efficientnet_b0"],
-    "pooling": ["max", "mean", "lse"],
+    "pooling": ["max", "mean", "lse", "attention", "gem"],
     "projection_dim": [0, 128, 192, 256, 384, 512],
     "hidden_dim": [128, 192, 256, 384, 512, 768],
     "fusion_depth": [1, 2, 3],
+    "fusion_gate": ["none", "se"],
     "dropout": [0.1, 0.15, 0.2, 0.25, 0.3],
     "lr": [1e-4, 2e-4, 3e-4, 4e-4, 6e-4],
     "weight_decay": [0.0, 1e-5, 1e-4, 5e-4],
@@ -56,6 +59,7 @@ DEFAULT_CONFIG = {
     "projection_dim": 0,
     "hidden_dim": 256,
     "fusion_depth": 2,
+    "fusion_gate": "none",
     "dropout": 0.2,
     "lr": 3e-4,
     "weight_decay": 1e-4,
@@ -147,6 +151,46 @@ def mutate_config(base_config, rng):
 
     if candidate["fusion_depth"] == 1:
         candidate["hidden_dim"] = base_config["hidden_dim"]
+
+    return candidate, mutations
+
+
+def initialize_research_state():
+    return {
+        prior["name"]: {
+            "trials": 0,
+            "keeps": 0,
+            "source": prior["source"],
+        }
+        for prior in RESEARCH_PRIORS
+    }
+
+
+def select_research_prior(research_state, rng):
+    scored = []
+    for prior in RESEARCH_PRIORS:
+        stats = research_state.get(prior["name"], {"trials": 0, "keeps": 0})
+        trial_penalty = stats["trials"]
+        success_bonus = stats["keeps"] * 0.25
+        novelty_bonus = rng.random() * 0.05
+        score = -trial_penalty + success_bonus + novelty_bonus
+        scored.append((score, prior))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def apply_research_prior(base_config, prior, rng):
+    candidate = deepcopy(base_config)
+    mutations = [f"research_prior:{prior['name']}"]
+    for key, value in prior["mutations"].items():
+        old_value = candidate.get(key)
+        candidate[key] = value
+        if old_value != value:
+            mutations.append(f"{key}:{old_value}->{value}")
+
+    if rng.random() < 0.5:
+        candidate, local_mutations = mutate_config(candidate, rng)
+        mutations.extend(f"local:{item}" for item in local_mutations)
 
     return candidate, mutations
 
@@ -265,8 +309,10 @@ def run(args):
                 "best_val_loss": None,
                 "config": deepcopy(DEFAULT_CONFIG),
             },
+            "research": initialize_research_state(),
         },
     )
+    state.setdefault("research", initialize_research_state())
     save_json(best_config_path, state["best"]["config"])
 
     rng = random.Random(args.seed + int(state["iteration"]))
@@ -275,7 +321,8 @@ def run(args):
     for _ in range(args.iterations):
         state["iteration"] += 1
         parent = deepcopy(state["best"])
-        candidate_config, mutations = mutate_config(parent["config"], rng)
+        prior = select_research_prior(state["research"], rng)
+        candidate_config, mutations = apply_research_prior(parent["config"], prior, rng)
         candidate_config = apply_runtime_overrides(candidate_config, args)
         candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
             script_dir=script_dir,
@@ -322,6 +369,7 @@ def run(args):
         }
         append_result(results_path, row)
         run_rows.append(row)
+        state["research"][prior["name"]]["trials"] += 1
 
         if status == "keep":
             state["best"] = {
@@ -331,6 +379,7 @@ def run(args):
                 "config": candidate_config,
             }
             save_json(best_config_path, candidate_config)
+            state["research"][prior["name"]]["keeps"] += 1
 
         save_json(state_path, state)
         print(
