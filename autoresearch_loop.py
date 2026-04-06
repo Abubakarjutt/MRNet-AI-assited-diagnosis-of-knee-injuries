@@ -89,6 +89,12 @@ def load_json(path, default):
         return json.load(handle)
 
 
+def merge_missing_defaults(config, defaults):
+    merged = deepcopy(defaults)
+    merged.update(config)
+    return merged
+
+
 def save_json(path, data):
     with open(path, "w") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
@@ -299,20 +305,27 @@ def run(args):
     best_config_path = os.path.join(state_dir, "best_config.json")
     ensure_results_file(results_path)
 
+    default_state = {
+        "iteration": 0,
+        "best": {
+            "name": "seed",
+            "best_val_auc": 0.0,
+            "best_val_loss": None,
+            "config": deepcopy(DEFAULT_CONFIG),
+        },
+        "research": initialize_research_state(),
+    }
     state = load_json(
         state_path,
-        {
-            "iteration": 0,
-            "best": {
-                "name": "seed",
-                "best_val_auc": 0.0,
-                "best_val_loss": None,
-                "config": deepcopy(DEFAULT_CONFIG),
-            },
-            "research": initialize_research_state(),
-        },
+        default_state,
     )
+    state.setdefault("iteration", 0)
+    state.setdefault("best", deepcopy(default_state["best"]))
     state.setdefault("research", initialize_research_state())
+    state["best"]["config"] = merge_missing_defaults(
+        state["best"].get("config", {}),
+        DEFAULT_CONFIG,
+    )
     save_json(best_config_path, state["best"]["config"])
 
     rng = random.Random(args.seed + int(state["iteration"]))
