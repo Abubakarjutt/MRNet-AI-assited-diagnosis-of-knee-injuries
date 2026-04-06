@@ -6,6 +6,7 @@ import random
 import re
 import subprocess
 import sys
+import traceback
 from copy import deepcopy
 from datetime import datetime
 
@@ -85,13 +86,24 @@ def ensure_dir(path):
 def load_json(path, default):
     if not os.path.exists(path):
         return deepcopy(default)
-    with open(path, "r") as handle:
-        return json.load(handle)
+    try:
+        with open(path, "r") as handle:
+            return json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return deepcopy(default)
 
 
 def merge_missing_defaults(config, defaults):
     merged = deepcopy(defaults)
     merged.update(config)
+    return merged
+
+
+def merge_research_state_defaults(research_state):
+    merged = initialize_research_state()
+    for name, value in (research_state or {}).items():
+        if name in merged and isinstance(value, dict):
+            merged[name].update(value)
     return merged
 
 
@@ -147,6 +159,8 @@ def mutate_config(base_config, rng):
     mutations = []
 
     for key in mutation_keys:
+        if key not in candidate:
+            candidate[key] = DEFAULT_CONFIG[key]
         old_value = candidate[key]
         new_value = choose_adjacent(old_value, SEARCH_SPACE[key], rng)
         if new_value == old_value and len(SEARCH_SPACE[key]) > 1:
@@ -321,7 +335,7 @@ def run(args):
     )
     state.setdefault("iteration", 0)
     state.setdefault("best", deepcopy(default_state["best"]))
-    state.setdefault("research", initialize_research_state())
+    state["research"] = merge_research_state_defaults(state.get("research"))
     state["best"]["config"] = merge_missing_defaults(
         state["best"].get("config", {}),
         DEFAULT_CONFIG,
@@ -334,21 +348,10 @@ def run(args):
     for _ in range(args.iterations):
         state["iteration"] += 1
         parent = deepcopy(state["best"])
-        prior = select_research_prior(state["research"], rng)
-        candidate_config, mutations = apply_research_prior(parent["config"], prior, rng)
-        candidate_config = apply_runtime_overrides(candidate_config, args)
-        candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
-            script_dir=script_dir,
-            logs_dir=logs_dir,
-            config_dir=config_dir,
-            cache_dir=cache_dir,
-            iteration=state["iteration"],
-            candidate=candidate_config,
-            data_root=args.data_root,
-        )
-        if should_retry_without_pretrained(returncode, log_text, candidate_config):
-            candidate_config["pretrained"] = 0
-            mutations.append("pretrained:1->0(auto-retry)")
+        try:
+            prior = select_research_prior(state["research"], rng)
+            candidate_config, mutations = apply_research_prior(parent["config"], prior, rng)
+            candidate_config = apply_runtime_overrides(candidate_config, args)
             candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
                 script_dir=script_dir,
                 logs_dir=logs_dir,
@@ -358,11 +361,37 @@ def run(args):
                 candidate=candidate_config,
                 data_root=args.data_root,
             )
+            if should_retry_without_pretrained(returncode, log_text, candidate_config):
+                candidate_config["pretrained"] = 0
+                mutations.append("pretrained:1->0(auto-retry)")
+                candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
+                    script_dir=script_dir,
+                    logs_dir=logs_dir,
+                    config_dir=config_dir,
+                    cache_dir=cache_dir,
+                    iteration=state["iteration"],
+                    candidate=candidate_config,
+                    data_root=args.data_root,
+                )
 
-        candidate_auc = float_or_default(summary["best_val_auc"])
-        status = "crash"
-        if returncode == 0 and summary["best_val_auc"] is not None:
-            status = "keep" if candidate_auc > parent["best_val_auc"] else "discard"
+            candidate_auc = float_or_default(summary["best_val_auc"])
+            status = "crash"
+            if returncode == 0 and summary["best_val_auc"] is not None:
+                status = "keep" if candidate_auc > parent["best_val_auc"] else "discard"
+        except Exception:
+            prior = {"name": "controller_exception"}
+            mutations = ["controller_exception"]
+            candidate_config = merge_missing_defaults(parent["config"], DEFAULT_CONFIG)
+            candidate_name = f"iter{state['iteration']:03d}_controller_exception"
+            config_path = os.path.join(config_dir, f"{candidate_name}.json")
+            log_path = os.path.join(logs_dir, f"{candidate_name}.log")
+            save_json(config_path, candidate_config)
+            with open(log_path, "w") as handle:
+                handle.write(traceback.format_exc())
+            returncode = 1
+            summary = {}
+            candidate_auc = 0.0
+            status = "crash"
 
         row = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -382,7 +411,8 @@ def run(args):
         }
         append_result(results_path, row)
         run_rows.append(row)
-        state["research"][prior["name"]]["trials"] += 1
+        if prior["name"] in state["research"]:
+            state["research"][prior["name"]]["trials"] += 1
 
         if status == "keep":
             state["best"] = {
@@ -392,7 +422,8 @@ def run(args):
                 "config": candidate_config,
             }
             save_json(best_config_path, candidate_config)
-            state["research"][prior["name"]]["keeps"] += 1
+            if prior["name"] in state["research"]:
+                state["research"][prior["name"]]["keeps"] += 1
 
         save_json(state_path, state)
         print(
