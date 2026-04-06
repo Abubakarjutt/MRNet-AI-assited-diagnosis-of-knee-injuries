@@ -127,10 +127,11 @@ python3 autoresearch_loop.py --iterations 1 --data_root MRNet-v1.0
 
 This loop is persistent and architecture-improving:
 
-- it loads the current best config from `~/.mrnet_autoresearch`
-- mutates a few architecture and training knobs
-- runs a fixed-budget experiment
-- promotes only better candidates
+- it runs the baseline first on a fresh state directory
+- it then loads the current best config from `~/.mrnet_autoresearch`
+- mutates a constrained architecture/training search surface
+- runs a fixed-budget experiment with a fixed evaluation harness
+- promotes only better candidates, or effectively tied but simpler ones
 
 The best architecture is persisted in:
 
@@ -168,6 +169,7 @@ The workflow uploads:
 - `ci_results/summary.md`
 - `ci_results/results.tsv`
 - `ci_results/best_config.json`
+- `ci_results/logs/`
 
 and it reuses the same persistent state directory on the self-hosted runner so future scheduled runs continue from the latest best architecture instead of restarting.
 
