@@ -11,7 +11,7 @@ The loop follows the same core principles as the original `autoresearch` reposit
 1. Keep the evaluation harness fixed.
 2. Use a fixed wall-clock budget per candidate.
 3. Establish a baseline first.
-4. Advance only when the new candidate is truly better, or effectively tied but simpler.
+4. Optimize validation AUC first, and use simplicity only to break true AUC ties.
 5. Run autonomously without waiting for human input between iterations.
 
 Each experiment should:
@@ -20,7 +20,7 @@ Each experiment should:
 2. Start from the current best known architecture after that baseline.
 3. Mutate a small number of architecture or training knobs.
 4. Run a fixed training budget.
-5. Keep the new configuration only if validation AUC improves, or if it is effectively tied while being simpler.
+5. Keep the new configuration only if validation AUC improves, or if AUC is effectively identical while the model is simpler.
 6. Use the kept winner as the parent for the next experiment.
 
 ## Source Of Truth

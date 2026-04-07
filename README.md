@@ -131,7 +131,8 @@ This loop is persistent and architecture-improving:
 - it then loads the current best config from `~/.mrnet_autoresearch`
 - mutates a constrained architecture/training search surface
 - runs a fixed-budget experiment with a fixed evaluation harness
-- promotes only better candidates, or effectively tied but simpler ones
+- uses validation AUC as the primary objective
+- uses simplicity only as a tie-breaker when AUC is effectively identical
 
 The best architecture is persisted in:
 

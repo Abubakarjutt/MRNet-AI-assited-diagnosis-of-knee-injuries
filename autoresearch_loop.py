@@ -89,7 +89,7 @@ NON_PERSISTED_OVERRIDE_KEYS = {
     "max_val_batches",
 }
 AUC_IMPROVEMENT_EPS = 1e-6
-SIMPLICITY_AUC_TOLERANCE = 1e-3
+AUC_TIE_EPS = 1e-6
 SIMPLICITY_PARAM_RATIO = 0.9
 MAX_DUPLICATE_RETRIES = 16
 
@@ -517,6 +517,29 @@ def backfill_best_metadata(state, result_rows):
     return state
 
 
+def make_best_entry(name, best_val_auc, best_val_loss, num_params_M, config):
+    persistent_config = persistent_config_snapshot(sanitize_search_config(config))
+    return {
+        "name": name,
+        "best_val_auc": float_or_default(best_val_auc, 0.0),
+        "best_val_loss": float_or_default(best_val_loss, None),
+        "num_params_M": float_or_default(num_params_M, None),
+        "complexity_score": config_complexity_score(persistent_config),
+        "config": persistent_config,
+    }
+
+
+def load_result_config(row):
+    config_path = row.get("config_path")
+    if not config_path:
+        return None
+    try:
+        with open(config_path, "r") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
 def is_simpler_candidate(parent, candidate_config, candidate_num_params):
     parent_num_params = parent.get("num_params_M")
     if (
@@ -535,6 +558,19 @@ def is_simpler_candidate(parent, candidate_config, candidate_num_params):
     return candidate_complexity < parent_complexity
 
 
+def is_better_objective_candidate(parent, candidate_auc, candidate_config, candidate_num_params):
+    parent_auc = float_or_default(parent.get("best_val_auc"), 0.0)
+    if candidate_auc > parent_auc + AUC_IMPROVEMENT_EPS:
+        return True
+
+    if abs(candidate_auc - parent_auc) <= AUC_TIE_EPS and is_simpler_candidate(
+        parent, candidate_config, candidate_num_params
+    ):
+        return True
+
+    return False
+
+
 def candidate_status(parent, candidate_auc, candidate_config, summary, returncode):
     if returncode != 0 or summary["best_val_auc"] is None:
         return "crash"
@@ -542,17 +578,54 @@ def candidate_status(parent, candidate_auc, candidate_config, summary, returncod
     if parent["name"] == "seed":
         return "keep"
 
-    if candidate_auc > parent["best_val_auc"] + AUC_IMPROVEMENT_EPS:
-        return "keep"
-
     candidate_num_params = float_or_default(summary["num_params_M"], None)
-    if (
-        candidate_auc >= parent["best_val_auc"] - SIMPLICITY_AUC_TOLERANCE
-        and is_simpler_candidate(parent, candidate_config, candidate_num_params)
-    ):
+    if is_better_objective_candidate(parent, candidate_auc, candidate_config, candidate_num_params):
         return "keep"
 
     return "discard"
+
+
+def recover_best_from_history(state, result_rows):
+    best = state.get("best", {})
+    recovered_best = None
+
+    if best.get("name") not in {None, "seed"}:
+        recovered_best = make_best_entry(
+            name=best.get("name", "seed"),
+            best_val_auc=best.get("best_val_auc", 0.0),
+            best_val_loss=best.get("best_val_loss"),
+            num_params_M=best.get("num_params_M"),
+            config=best.get("config", {}),
+        )
+
+    for row in result_rows:
+        if row.get("status") == "crash":
+            continue
+        if row.get("best_val_auc") in {None, "", "nan"}:
+            continue
+        config = load_result_config(row)
+        if config is None:
+            continue
+
+        candidate = make_best_entry(
+            name=row.get("candidate_name", "unknown"),
+            best_val_auc=row.get("best_val_auc", 0.0),
+            best_val_loss=row.get("best_val_loss"),
+            num_params_M=row.get("num_params_M"),
+            config=config,
+        )
+        if recovered_best is None or is_better_objective_candidate(
+            recovered_best,
+            candidate["best_val_auc"],
+            candidate["config"],
+            candidate.get("num_params_M"),
+        ):
+            recovered_best = candidate
+
+    if recovered_best is not None:
+        state["best"] = recovered_best
+
+    return state
 
 
 def write_lock_summary(path, message):
@@ -623,6 +696,7 @@ def run(args):
             state["best"]["config"] = apply_runtime_overrides(state["best"]["config"], args)
             state["best"]["config"] = persistent_config_snapshot(state["best"]["config"])
             state = backfill_best_metadata(state, result_rows)
+            state = recover_best_from_history(state, result_rows)
             save_json(best_config_path, state["best"]["config"])
             save_json(state_path, state)
 
