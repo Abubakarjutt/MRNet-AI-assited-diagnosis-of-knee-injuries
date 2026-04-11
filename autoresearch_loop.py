@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -116,8 +117,29 @@ class LockUnavailableError(RuntimeError):
     pass
 
 
+class LowDiskSpaceError(RuntimeError):
+    pass
+
+
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
+
+
+def format_gb(num_bytes):
+    return f"{num_bytes / (1024 ** 3):.2f} GiB"
+
+
+def ensure_free_space(path, min_free_gb, context):
+    if min_free_gb is None or float(min_free_gb) <= 0:
+        return
+
+    free_bytes = shutil.disk_usage(path).free
+    min_free_bytes = int(float(min_free_gb) * (1024 ** 3))
+    if free_bytes < min_free_bytes:
+        raise LowDiskSpaceError(
+            f"Stopped early because free space at {path} is {format_gb(free_bytes)}, "
+            f"below the required {float(min_free_gb):.1f} GiB while {context}."
+        )
 
 
 def load_json(path, default):
@@ -520,12 +542,17 @@ def should_retry_without_pretrained(returncode, log_text, candidate_config):
     return any(marker in log_text for marker in retry_markers)
 
 
-def write_markdown_summary(path, state, rows):
+def write_markdown_summary(path, state, rows, notes=None):
     with open(path, "w") as handle:
         handle.write("# MRNet Autoresearch Summary\n\n")
         best = state["best"]
         handle.write(f"Best candidate: `{best['name']}`\n\n")
         handle.write(f"Best validation AUC: `{best['best_val_auc']:.6f}`\n\n")
+        if notes:
+            handle.write("## Notes\n\n")
+            for note in notes:
+                handle.write(f"- {note}\n")
+            handle.write("\n")
         handle.write("## Current Best Config\n\n")
         handle.write("```json\n")
         handle.write(json.dumps(best["config"], indent=2, sort_keys=True))
@@ -794,9 +821,12 @@ def run(args):
     state_path = os.path.join(state_dir, "state.json")
     best_config_path = os.path.join(state_dir, "best_config.json")
     lock_path = os.path.join(state_dir, LOCK_FILENAME)
+    state = None
+    run_rows = []
 
     try:
         with advisory_lock(lock_path):
+            ensure_free_space(state_dir, args.min_free_gb, "starting autoresearch")
             ensure_results_file(results_path)
 
             default_state = {
@@ -829,7 +859,6 @@ def run(args):
             save_json(state_path, state)
 
             rng = random.Random(args.seed + int(state["iteration"]))
-            run_rows = []
             run_baseline_first = is_fresh_state(state, result_rows)
             seen_signatures = load_seen_signatures(config_dir)
             seen_signatures.add(config_signature(state["best"]["config"]))
@@ -947,11 +976,20 @@ def run(args):
                     f"iteration={state['iteration']} candidate={candidate_name} "
                     f"status={status} val_auc={candidate_auc:.6f}"
                 )
+                ensure_free_space(state_dir, args.min_free_gb, "continuing autoresearch")
 
             write_latest_run_manifest(state_dir, run_rows)
             write_best_only_manifest(state_dir, state["best"]["name"])
             if args.summary_file:
                 write_markdown_summary(args.summary_file, state, run_rows)
+    except LowDiskSpaceError as exc:
+        message = str(exc)
+        print(message)
+        if args.summary_file and state is not None:
+            write_markdown_summary(args.summary_file, state, run_rows, notes=[message])
+        else:
+            write_lock_summary(args.summary_file, message)
+        return
     except LockUnavailableError as exc:
         message = f"Skipped run because {exc}."
         print(message)
@@ -986,6 +1024,7 @@ def parse_args():
     parser.add_argument("--max_val_batches", type=int, default=None)
     parser.add_argument("--pretrained", type=int, choices=[0, 1], default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--min_free_gb", type=float, default=40.0)
     return parser.parse_args()
 
 

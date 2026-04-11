@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import time
 from pathlib import Path
 
 
@@ -27,6 +28,31 @@ def file_size(path: Path) -> int:
         return path.stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def path_size(path: Path) -> int:
+    if path.is_file():
+        return file_size(path)
+    if not path.exists():
+        return 0
+
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += file_size(child)
+    return total
+
+
+def remove_path(path: Path) -> int:
+    removed_bytes = path_size(path)
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        return 0
+    return removed_bytes
 
 
 def prune_keep_newest(files: list[Path], keep: int) -> tuple[int, int]:
@@ -56,6 +82,48 @@ def prune_named_logs(diag_dir: Path, prefix: str, keep: int) -> tuple[int, int]:
     return prune_keep_newest(files, keep)
 
 
+def prune_old_files(directory: Path, keep: int, max_age_hours: float) -> tuple[int, int]:
+    if not directory.is_dir():
+        return 0, 0
+
+    cutoff = time.time() - max(0.0, max_age_hours) * 3600.0
+    candidates = [
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.stat().st_mtime < cutoff
+    ]
+    return prune_keep_newest(candidates, keep)
+
+
+def prune_old_workspace_roots(
+    work_dir: Path,
+    keep_roots: set[str],
+    max_age_hours: float,
+) -> tuple[int, int]:
+    if not work_dir.is_dir():
+        return 0, 0
+
+    removed_count = 0
+    removed_bytes = 0
+    cutoff = time.time() - max(0.0, max_age_hours) * 3600.0
+
+    for path in work_dir.iterdir():
+        if not path.is_dir():
+            continue
+        if path.name.startswith("_") or path.name in keep_roots:
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if modified >= cutoff:
+            continue
+        removed_bytes += remove_path(path)
+        removed_count += 1
+
+    return removed_count, removed_bytes
+
+
 def format_gb(num_bytes: int) -> str:
     return f"{num_bytes / (1024 ** 3):.2f} GiB"
 
@@ -67,6 +135,17 @@ def main() -> int:
     parser.add_argument("--keep-worker-logs", type=int, default=6)
     parser.add_argument("--keep-pages", type=int, default=64)
     parser.add_argument("--keep-blocks", type=int, default=64)
+    parser.add_argument("--keep-temp-files", type=int, default=32)
+    parser.add_argument("--keep-runner-command-files", type=int, default=64)
+    parser.add_argument("--keep-workflow-files", type=int, default=8)
+    parser.add_argument("--temp-max-age-hours", type=float, default=6.0)
+    parser.add_argument("--workspace-max-age-hours", type=float, default=168.0)
+    parser.add_argument(
+        "--keep-workspace-root",
+        action="append",
+        default=[],
+        help="Top-level directory names under _work that must not be removed.",
+    )
     parser.add_argument("--min-free-gb", type=float, default=20.0)
     args = parser.parse_args()
 
@@ -74,6 +153,10 @@ def main() -> int:
     diag_dir = runner_root / "_diag"
     pages_dir = diag_dir / "pages"
     blocks_dir = diag_dir / "blocks"
+    work_dir = runner_root / "_work"
+    temp_dir = work_dir / "_temp"
+    runner_commands_dir = temp_dir / "_runner_file_commands"
+    workflow_temp_dir = temp_dir / "_github_workflow"
 
     total_removed_count = 0
     total_removed_bytes = 0
@@ -83,6 +166,22 @@ def main() -> int:
         prune_named_logs(diag_dir, "Worker", args.keep_worker_logs),
         prune_directory_entries(pages_dir, args.keep_pages),
         prune_directory_entries(blocks_dir, args.keep_blocks),
+        prune_old_files(temp_dir, args.keep_temp_files, args.temp_max_age_hours),
+        prune_old_files(
+            runner_commands_dir,
+            args.keep_runner_command_files,
+            args.temp_max_age_hours,
+        ),
+        prune_old_files(
+            workflow_temp_dir,
+            args.keep_workflow_files,
+            args.temp_max_age_hours,
+        ),
+        prune_old_workspace_roots(
+            work_dir,
+            keep_roots=set(args.keep_workspace_root),
+            max_age_hours=args.workspace_max_age_hours,
+        ),
     ]:
         total_removed_count += removed_count
         total_removed_bytes += removed_bytes
