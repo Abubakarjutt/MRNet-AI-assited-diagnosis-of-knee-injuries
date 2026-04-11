@@ -209,6 +209,47 @@ def maybe_load_search_config(args):
     return args
 
 
+def maybe_load_init_checkpoint(model, checkpoint_path):
+    if not checkpoint_path:
+        return
+
+    if not os.path.isfile(checkpoint_path):
+        print(f"Skipping init checkpoint because it does not exist: {checkpoint_path}")
+        return
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+
+    if not isinstance(checkpoint, dict):
+        print(f"Skipping init checkpoint because it is not a state_dict: {checkpoint_path}")
+        return
+
+    model_state = model.state_dict()
+    compatible = {}
+    skipped_shape = []
+
+    for key, value in checkpoint.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_shape.append(key)
+            continue
+        compatible[key] = value
+
+    if not compatible:
+        print(f"No compatible tensors found in init checkpoint: {checkpoint_path}")
+        return
+
+    load_result = model.load_state_dict(compatible, strict=False)
+    print(
+        f"Warm-started from {checkpoint_path} with {len(compatible)} tensors; "
+        f"missing={len(load_result.missing_keys)} "
+        f"unexpected={len(load_result.unexpected_keys)} "
+        f"shape_mismatch={len(skipped_shape)}"
+    )
+
+
 def run(args):
     if args.batch_size != 1:
         raise ValueError("MRNet training currently expects --batch_size 1 because slice counts vary by exam.")
@@ -249,6 +290,7 @@ def run(args):
     val_loader = build_dataloader(val_dataset, shuffle=False, args=args)
 
     model = build_model(args)
+    maybe_load_init_checkpoint(model, args.init_checkpoint)
     model = utils.maybe_channels_last(model, device)
     model.to(device)
 
@@ -470,6 +512,12 @@ def parse_arguments():
         type=str,
         default=None,
         help="Optional JSON file containing an autoresearch-selected model/training configuration.",
+    )
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used to warm-start compatible layers.",
     )
     return parser.parse_args()
 

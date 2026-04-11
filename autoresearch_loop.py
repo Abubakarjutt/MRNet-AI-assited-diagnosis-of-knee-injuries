@@ -86,6 +86,7 @@ DEFAULT_CONFIG = {
 LOCK_FILENAME = "loop.lock"
 TIMEOUT_GRACE_MINUTES = 15
 BEST_MODEL_FILENAME = "best_model.pth"
+BEST_MODEL_META_FILENAME = "best_model_meta.json"
 NON_PERSISTED_OVERRIDE_KEYS = {
     "max_train_batches",
     "max_val_batches",
@@ -335,8 +336,8 @@ def apply_research_prior(base_config, prior, rng):
     return candidate, mutations
 
 
-def build_train_command(prefix_name, config_path, data_root):
-    return [
+def build_train_command(prefix_name, config_path, data_root, init_checkpoint=None):
+    command = [
         sys.executable,
         "train.py",
         "--prefix_name",
@@ -346,6 +347,9 @@ def build_train_command(prefix_name, config_path, data_root):
         "--search_config",
         config_path,
     ]
+    if init_checkpoint:
+        command.extend(["--init_checkpoint", init_checkpoint])
+    return command
 
 
 def model_dir(script_dir):
@@ -354,6 +358,10 @@ def model_dir(script_dir):
 
 def best_model_path(script_dir):
     return os.path.join(model_dir(script_dir), BEST_MODEL_FILENAME)
+
+
+def best_model_meta_path(script_dir):
+    return os.path.join(model_dir(script_dir), BEST_MODEL_META_FILENAME)
 
 
 def candidate_model_paths(script_dir, candidate_name):
@@ -379,7 +387,34 @@ def prune_model_dir(script_dir, keep_paths=None):
             remove_paths([path])
 
 
-def promote_candidate_model(script_dir, candidate_name):
+def load_best_model_meta(script_dir):
+    return load_json(best_model_meta_path(script_dir), default={})
+
+
+def save_best_model_meta(script_dir, metadata):
+    os.makedirs(model_dir(script_dir), exist_ok=True)
+    save_json(best_model_meta_path(script_dir), metadata)
+
+
+def best_checkpoint_for_parent(script_dir, parent):
+    checkpoint_path = best_model_path(script_dir)
+    meta = load_best_model_meta(script_dir)
+    if not os.path.isfile(checkpoint_path):
+        return None
+
+    if not meta:
+        return None
+
+    if meta.get("candidate_name") != parent.get("name"):
+        return None
+
+    if meta.get("config_signature") != config_signature(parent.get("config", {})):
+        return None
+
+    return checkpoint_path
+
+
+def promote_candidate_model(script_dir, candidate_name, candidate_config, candidate_auc):
     paths = candidate_model_paths(script_dir, candidate_name)
     if not paths:
         return None
@@ -393,6 +428,14 @@ def promote_candidate_model(script_dir, candidate_name):
         os.replace(promoted_src, promoted_dst)
 
     prune_model_dir(script_dir, keep_paths=[promoted_dst])
+    save_best_model_meta(
+        script_dir,
+        {
+            "candidate_name": candidate_name,
+            "config_signature": config_signature(candidate_config),
+            "best_val_auc": candidate_auc,
+        },
+    )
     return promoted_dst
 
 
@@ -400,7 +443,16 @@ def discard_candidate_model(script_dir, candidate_name):
     remove_paths(candidate_model_paths(script_dir, candidate_name))
 
 
-def run_candidate(script_dir, logs_dir, config_dir, cache_dir, iteration, candidate, data_root):
+def run_candidate(
+    script_dir,
+    logs_dir,
+    config_dir,
+    cache_dir,
+    iteration,
+    candidate,
+    data_root,
+    init_checkpoint=None,
+):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     candidate_name = f"iter{iteration:03d}_{timestamp}"
     config_path = os.path.join(config_dir, f"{candidate_name}.json")
@@ -409,7 +461,7 @@ def run_candidate(script_dir, logs_dir, config_dir, cache_dir, iteration, candid
     execution_candidate["save_model"] = 1
     save_json(config_path, execution_candidate)
 
-    command = build_train_command(candidate_name, config_path, data_root)
+    command = build_train_command(candidate_name, config_path, data_root, init_checkpoint=init_checkpoint)
     env = os.environ.copy()
     env["TORCH_HOME"] = cache_dir
     timeout_seconds = None
@@ -795,6 +847,7 @@ def run(args):
                         force_baseline=run_baseline_first,
                     )
                     run_baseline_first = False
+                    init_checkpoint = best_checkpoint_for_parent(script_dir, parent)
                     candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
                         script_dir=script_dir,
                         logs_dir=logs_dir,
@@ -803,6 +856,7 @@ def run(args):
                         iteration=state["iteration"],
                         candidate=candidate_config,
                         data_root=args.data_root,
+                        init_checkpoint=init_checkpoint,
                     )
                     if should_retry_without_pretrained(returncode, log_text, candidate_config):
                         discard_candidate_model(script_dir, candidate_name)
@@ -816,6 +870,7 @@ def run(args):
                             iteration=state["iteration"],
                             candidate=candidate_config,
                             data_root=args.data_root,
+                            init_checkpoint=init_checkpoint,
                         )
 
                     candidate_auc = float_or_default(summary["best_val_auc"])
@@ -842,7 +897,12 @@ def run(args):
                     status = "crash"
 
                 if status == "keep":
-                    promote_candidate_model(script_dir, candidate_name)
+                    promote_candidate_model(
+                        script_dir,
+                        candidate_name,
+                        candidate_config,
+                        candidate_auc,
+                    )
                 else:
                     discard_candidate_model(script_dir, candidate_name)
 
