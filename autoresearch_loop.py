@@ -470,6 +470,7 @@ def run_candidate(
     logs_dir,
     config_dir,
     cache_dir,
+    temp_root_dir,
     iteration,
     candidate,
     data_root,
@@ -486,6 +487,11 @@ def run_candidate(
     command = build_train_command(candidate_name, config_path, data_root, init_checkpoint=init_checkpoint)
     env = os.environ.copy()
     env["TORCH_HOME"] = cache_dir
+    candidate_tmp_dir = os.path.join(temp_root_dir, candidate_name)
+    ensure_dir(candidate_tmp_dir)
+    env["TMPDIR"] = candidate_tmp_dir
+    env["TMP"] = candidate_tmp_dir
+    env["TEMP"] = candidate_tmp_dir
     timeout_seconds = None
     time_budget_minutes = candidate.get("time_budget_minutes")
     if time_budget_minutes is not None:
@@ -524,6 +530,8 @@ def run_candidate(
             "\n[autoresearch] Candidate timed out after "
             f"{timeout_seconds} seconds and was terminated.\n"
         )
+
+    shutil.rmtree(candidate_tmp_dir, ignore_errors=True)
 
     summary = parse_summary(log_text)
     return candidate_name, config_path, log_path, returncode, summary, log_text
@@ -813,9 +821,11 @@ def run(args):
     logs_dir = os.path.join(state_dir, "logs")
     config_dir = os.path.join(state_dir, "configs")
     cache_dir = os.path.join(state_dir, "torch_cache")
+    temp_root_dir = os.path.join(state_dir, "tmp")
     ensure_dir(logs_dir)
     ensure_dir(config_dir)
     ensure_dir(cache_dir)
+    ensure_dir(temp_root_dir)
 
     results_path = os.path.join(state_dir, "results.tsv")
     state_path = os.path.join(state_dir, "state.json")
@@ -882,6 +892,7 @@ def run(args):
                         logs_dir=logs_dir,
                         config_dir=config_dir,
                         cache_dir=cache_dir,
+                        temp_root_dir=temp_root_dir,
                         iteration=state["iteration"],
                         candidate=candidate_config,
                         data_root=args.data_root,
@@ -896,6 +907,7 @@ def run(args):
                             logs_dir=logs_dir,
                             config_dir=config_dir,
                             cache_dir=cache_dir,
+                            temp_root_dir=temp_root_dir,
                             iteration=state["iteration"],
                             candidate=candidate_config,
                             data_root=args.data_root,
