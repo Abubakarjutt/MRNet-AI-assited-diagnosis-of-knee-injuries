@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from glob import glob
 from copy import deepcopy
 from datetime import datetime
 
@@ -84,9 +85,11 @@ DEFAULT_CONFIG = {
 
 LOCK_FILENAME = "loop.lock"
 TIMEOUT_GRACE_MINUTES = 15
+BEST_MODEL_FILENAME = "best_model.pth"
 NON_PERSISTED_OVERRIDE_KEYS = {
     "max_train_batches",
     "max_val_batches",
+    "save_model",
 }
 AUC_IMPROVEMENT_EPS = 1e-6
 AUC_TIE_EPS = 1e-6
@@ -345,12 +348,66 @@ def build_train_command(prefix_name, config_path, data_root):
     ]
 
 
+def model_dir(script_dir):
+    return os.path.join(script_dir, "models")
+
+
+def best_model_path(script_dir):
+    return os.path.join(model_dir(script_dir), BEST_MODEL_FILENAME)
+
+
+def candidate_model_paths(script_dir, candidate_name):
+    pattern = os.path.join(model_dir(script_dir), f"model_{candidate_name}_*.pth")
+    return sorted(glob(pattern))
+
+
+def remove_paths(paths):
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+
+
+def prune_model_dir(script_dir, keep_paths=None):
+    keep_paths = {os.path.abspath(path) for path in (keep_paths or [])}
+    model_root = model_dir(script_dir)
+    if not os.path.isdir(model_root):
+        return
+    for path in glob(os.path.join(model_root, "*.pth")):
+        if os.path.abspath(path) not in keep_paths:
+            remove_paths([path])
+
+
+def promote_candidate_model(script_dir, candidate_name):
+    paths = candidate_model_paths(script_dir, candidate_name)
+    if not paths:
+        return None
+
+    os.makedirs(model_dir(script_dir), exist_ok=True)
+    promoted_src = max(paths, key=os.path.getmtime)
+    promoted_dst = best_model_path(script_dir)
+    if os.path.abspath(promoted_src) != os.path.abspath(promoted_dst):
+        if os.path.exists(promoted_dst):
+            os.remove(promoted_dst)
+        os.replace(promoted_src, promoted_dst)
+
+    prune_model_dir(script_dir, keep_paths=[promoted_dst])
+    return promoted_dst
+
+
+def discard_candidate_model(script_dir, candidate_name):
+    remove_paths(candidate_model_paths(script_dir, candidate_name))
+
+
 def run_candidate(script_dir, logs_dir, config_dir, cache_dir, iteration, candidate, data_root):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     candidate_name = f"iter{iteration:03d}_{timestamp}"
     config_path = os.path.join(config_dir, f"{candidate_name}.json")
     log_path = os.path.join(logs_dir, f"{candidate_name}.log")
-    save_json(config_path, candidate)
+    execution_candidate = deepcopy(candidate)
+    execution_candidate["save_model"] = 1
+    save_json(config_path, execution_candidate)
 
     command = build_train_command(candidate_name, config_path, data_root)
     env = os.environ.copy()
@@ -654,6 +711,22 @@ def write_latest_run_manifest(state_dir, run_rows):
     save_json(manifest_path, manifest)
 
 
+def write_best_only_manifest(state_dir, best_name):
+    manifest_path = os.path.join(state_dir, "latest_run_files.json")
+    row = {
+        "iteration": None,
+        "candidate_name": best_name,
+        "status": "best",
+        "log_file": os.path.join(state_dir, "logs", f"{best_name}.log"),
+        "config_path": os.path.join(state_dir, "configs", f"{best_name}.json"),
+    }
+    manifest = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "rows": [row],
+    }
+    save_json(manifest_path, manifest)
+
+
 def run(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     state_dir = os.path.expanduser(args.state_dir)
@@ -697,6 +770,9 @@ def run(args):
             state["best"]["config"] = persistent_config_snapshot(state["best"]["config"])
             state = backfill_best_metadata(state, result_rows)
             state = recover_best_from_history(state, result_rows)
+            current_best_model_path = best_model_path(script_dir)
+            if os.path.exists(current_best_model_path):
+                prune_model_dir(script_dir, keep_paths=[current_best_model_path])
             save_json(best_config_path, state["best"]["config"])
             save_json(state_path, state)
 
@@ -729,6 +805,7 @@ def run(args):
                         data_root=args.data_root,
                     )
                     if should_retry_without_pretrained(returncode, log_text, candidate_config):
+                        discard_candidate_model(script_dir, candidate_name)
                         candidate_config["pretrained"] = 0
                         mutations.append("pretrained:1->0(auto-retry)")
                         candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
@@ -763,6 +840,11 @@ def run(args):
                     summary = {}
                     candidate_auc = 0.0
                     status = "crash"
+
+                if status == "keep":
+                    promote_candidate_model(script_dir, candidate_name)
+                else:
+                    discard_candidate_model(script_dir, candidate_name)
 
                 row = {
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -807,6 +889,7 @@ def run(args):
                 )
 
             write_latest_run_manifest(state_dir, run_rows)
+            write_best_only_manifest(state_dir, state["best"]["name"])
             if args.summary_file:
                 write_markdown_summary(args.summary_file, state, run_rows)
     except LockUnavailableError as exc:
