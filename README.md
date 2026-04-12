@@ -140,6 +140,14 @@ The best architecture is persisted in:
 ~/.mrnet_autoresearch/best_config.json
 ```
 
+The best checkpoint is persisted in:
+
+```bash
+~/.mrnet_autoresearch/models/best_model.pth
+```
+
+Only this canonical best checkpoint is retained; candidate checkpoints are pruned after each iteration.
+
 The full run history is persisted in:
 
 ```bash

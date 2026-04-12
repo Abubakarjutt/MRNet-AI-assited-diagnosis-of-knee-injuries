@@ -26,6 +26,7 @@ SUMMARY_PATTERNS = {
     "epochs_ran": re.compile(r"^epochs_ran:\s+([0-9]+)$", re.MULTILINE),
     "num_params_M": re.compile(r"^num_params_M:\s+([0-9.]+)$", re.MULTILINE),
     "device": re.compile(r"^device:\s+([a-z]+)$", re.MULTILINE),
+"model_complexity": re.compile(r"^model_complexity:\s+([0-9.]+)$", re.MULTILINE),
 }
 
 RESULT_COLUMNS = [
@@ -40,6 +41,7 @@ RESULT_COLUMNS = [
     "epochs_ran",
     "num_params_M",
     "device",
+     "model_complexity",
     "mutations",
     "config_path",
     "log_file",
@@ -209,11 +211,16 @@ def save_json(path, data):
     atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def normalize_result_row(row):
+    return {column: row.get(column, "") for column in RESULT_COLUMNS}
+
+
 def read_results_rows(path):
     if not os.path.exists(path):
         return []
     with open(path, "r", newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
+        reader = csv.DictReader(handle, delimiter="	")
+        return [normalize_result_row(row) for row in reader]
 
 
 def find_result_row(rows, candidate_name):
@@ -225,9 +232,9 @@ def find_result_row(rows, candidate_name):
 
 def serialize_results(rows):
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=RESULT_COLUMNS, delimiter="\t")
+    writer = csv.DictWriter(buffer, fieldnames=RESULT_COLUMNS, delimiter="	", extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows(normalize_result_row(row) for row in rows)
     return buffer.getvalue()
 
 
@@ -237,9 +244,16 @@ def config_signature(config):
 
 
 def ensure_results_file(path):
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        atomic_write_text(path, serialize_results([]))
         return
-    atomic_write_text(path, serialize_results([]))
+
+    rows = read_results_rows(path)
+    with open(path, "r", newline="") as handle:
+        reader = csv.reader(handle, delimiter="	")
+        current_header = next(reader, [])
+    if current_header != RESULT_COLUMNS:
+        atomic_write_text(path, serialize_results(rows))
 
 
 def append_result(path, row):
@@ -330,13 +344,35 @@ def initialize_research_state():
 
 
 def select_research_prior(research_state, rng):
+    # Prioritize baseline and simpler models when trials are low
+    # This encourages exploration of simple architectures first
     scored = []
     for prior in RESEARCH_PRIORS:
         stats = research_state.get(prior["name"], {"trials": 0, "keeps": 0})
         trial_penalty = stats["trials"]
         success_bonus = stats["keeps"] * 0.25
+
+        # Bonus for simple models when we haven't explored much yet
+        simplicity_bonus = 0.0
+        if stats["trials"] < 3:
+            # Give priority to baseline and simple models early on
+            if prior["name"] in ["simple_mean_pool_linear", "fast_mobilenet_screen", "gem_slice_pooling"]:
+                simplicity_bonus = 0.5
+            elif prior["name"] in ["mil_attention_pooling", "se_fusion_gate", "compact_highres_backbone"]:
+                simplicity_bonus = 0.3
+
+        # Penalize complex models until simpler ones are explored
+        complexity_penalty = 0.0
+        if stats["trials"] < 2:
+            complex_priors = [
+                "transmil_multi_instance", "cross_attention_fusion", "swin_transformer_lite",
+                "mae_pretrain_refinement", "adaptive_depth_network", "dinov2_efficient_backbone"
+            ]
+            if prior["name"] in complex_priors:
+                complexity_penalty = 0.3
+
         novelty_bonus = rng.random() * 0.05
-        score = -trial_penalty + success_bonus + novelty_bonus
+        score = -trial_penalty + success_bonus + simplicity_bonus - complexity_penalty + novelty_bonus
         scored.append((score, prior))
     scored.sort(key=lambda item: item[0], reverse=True)
     return scored[0][1]
@@ -374,20 +410,20 @@ def build_train_command(prefix_name, config_path, data_root, init_checkpoint=Non
     return command
 
 
-def model_dir(script_dir):
-    return os.path.join(script_dir, "models")
+def model_dir(storage_root):
+    return os.path.join(storage_root, "models")
 
 
-def best_model_path(script_dir):
-    return os.path.join(model_dir(script_dir), BEST_MODEL_FILENAME)
+def best_model_path(storage_root):
+    return os.path.join(model_dir(storage_root), BEST_MODEL_FILENAME)
 
 
-def best_model_meta_path(script_dir):
-    return os.path.join(model_dir(script_dir), BEST_MODEL_META_FILENAME)
+def best_model_meta_path(storage_root):
+    return os.path.join(model_dir(storage_root), BEST_MODEL_META_FILENAME)
 
 
-def candidate_model_paths(script_dir, candidate_name):
-    pattern = os.path.join(model_dir(script_dir), f"model_{candidate_name}_*.pth")
+def candidate_model_paths(storage_root, candidate_name):
+    pattern = os.path.join(model_dir(storage_root), f"model_{candidate_name}_*.pth")
     return sorted(glob(pattern))
 
 
@@ -399,9 +435,9 @@ def remove_paths(paths):
             continue
 
 
-def prune_model_dir(script_dir, keep_paths=None):
+def prune_model_dir(storage_root, keep_paths=None):
     keep_paths = {os.path.abspath(path) for path in (keep_paths or [])}
-    model_root = model_dir(script_dir)
+    model_root = model_dir(storage_root)
     if not os.path.isdir(model_root):
         return
     for path in glob(os.path.join(model_root, "*.pth")):
@@ -409,18 +445,18 @@ def prune_model_dir(script_dir, keep_paths=None):
             remove_paths([path])
 
 
-def load_best_model_meta(script_dir):
-    return load_json(best_model_meta_path(script_dir), default={})
+def load_best_model_meta(storage_root):
+    return load_json(best_model_meta_path(storage_root), default={})
 
 
-def save_best_model_meta(script_dir, metadata):
-    os.makedirs(model_dir(script_dir), exist_ok=True)
-    save_json(best_model_meta_path(script_dir), metadata)
+def save_best_model_meta(storage_root, metadata):
+    os.makedirs(model_dir(storage_root), exist_ok=True)
+    save_json(best_model_meta_path(storage_root), metadata)
 
 
-def best_checkpoint_for_parent(script_dir, parent):
-    checkpoint_path = best_model_path(script_dir)
-    meta = load_best_model_meta(script_dir)
+def best_checkpoint_for_parent(storage_root, parent):
+    checkpoint_path = best_model_path(storage_root)
+    meta = load_best_model_meta(storage_root)
     if not os.path.isfile(checkpoint_path):
         return None
 
@@ -436,22 +472,22 @@ def best_checkpoint_for_parent(script_dir, parent):
     return checkpoint_path
 
 
-def promote_candidate_model(script_dir, candidate_name, candidate_config, candidate_auc):
-    paths = candidate_model_paths(script_dir, candidate_name)
+def promote_candidate_model(storage_root, candidate_name, candidate_config, candidate_auc):
+    paths = candidate_model_paths(storage_root, candidate_name)
     if not paths:
         return None
 
-    os.makedirs(model_dir(script_dir), exist_ok=True)
+    os.makedirs(model_dir(storage_root), exist_ok=True)
     promoted_src = max(paths, key=os.path.getmtime)
-    promoted_dst = best_model_path(script_dir)
+    promoted_dst = best_model_path(storage_root)
     if os.path.abspath(promoted_src) != os.path.abspath(promoted_dst):
         if os.path.exists(promoted_dst):
             os.remove(promoted_dst)
         os.replace(promoted_src, promoted_dst)
 
-    prune_model_dir(script_dir, keep_paths=[promoted_dst])
+    prune_model_dir(storage_root, keep_paths=[promoted_dst])
     save_best_model_meta(
-        script_dir,
+        storage_root,
         {
             "candidate_name": candidate_name,
             "config_signature": config_signature(candidate_config),
@@ -461,8 +497,11 @@ def promote_candidate_model(script_dir, candidate_name, candidate_config, candid
     return promoted_dst
 
 
-def discard_candidate_model(script_dir, candidate_name):
-    remove_paths(candidate_model_paths(script_dir, candidate_name))
+def discard_candidate_model(storage_root, candidate_name):
+    remove_paths(candidate_model_paths(storage_root, candidate_name))
+    keep_path = best_model_path(storage_root)
+    keep_paths = [keep_path] if os.path.isfile(keep_path) else []
+    prune_model_dir(storage_root, keep_paths=keep_paths)
 
 
 def run_candidate(
@@ -474,6 +513,7 @@ def run_candidate(
     iteration,
     candidate,
     data_root,
+    model_storage_root,
     init_checkpoint=None,
 ):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -487,6 +527,7 @@ def run_candidate(
     command = build_train_command(candidate_name, config_path, data_root, init_checkpoint=init_checkpoint)
     env = os.environ.copy()
     env["TORCH_HOME"] = cache_dir
+    env["MRNET_MODEL_DIR"] = model_dir(model_storage_root)
     candidate_tmp_dir = os.path.join(temp_root_dir, candidate_name)
     ensure_dir(candidate_tmp_dir)
     env["TMPDIR"] = candidate_tmp_dir
@@ -658,6 +699,9 @@ def backfill_best_metadata(state, result_rows):
         row = find_result_row(result_rows, best["name"])
         if row is not None:
             best["num_params_M"] = float_or_default(row.get("num_params_M"), None)
+             # Use model_complexity from training output when available
+            if row.get("model_complexity") is not None:
+                best["complexity_score"] = float_or_default(row["model_complexity"], best.get("complexity_score"))
     return state
 
 
@@ -723,7 +767,8 @@ def candidate_status(parent, candidate_auc, candidate_config, summary, returncod
         return "keep"
 
     candidate_num_params = float_or_default(summary["num_params_M"], None)
-    if is_better_objective_candidate(parent, candidate_auc, candidate_config, candidate_num_params):
+    candidate_complexity = float_or_default(summary.get("model_complexity"), None)
+    if is_better_objective_candidate(parent, candidate_auc, candidate_config, candidate_num_params, candidate_complexity):
         return "keep"
 
     return "discard"
@@ -826,6 +871,7 @@ def run(args):
     ensure_dir(config_dir)
     ensure_dir(cache_dir)
     ensure_dir(temp_root_dir)
+    ensure_dir(model_dir(state_dir))
 
     results_path = os.path.join(state_dir, "results.tsv")
     state_path = os.path.join(state_dir, "state.json")
@@ -862,9 +908,9 @@ def run(args):
             state["best"]["config"] = persistent_config_snapshot(state["best"]["config"])
             state = backfill_best_metadata(state, result_rows)
             state = recover_best_from_history(state, result_rows)
-            current_best_model_path = best_model_path(script_dir)
-            if os.path.exists(current_best_model_path):
-                prune_model_dir(script_dir, keep_paths=[current_best_model_path])
+            current_best_model_path = best_model_path(state_dir)
+            keep_paths = [current_best_model_path] if os.path.exists(current_best_model_path) else []
+            prune_model_dir(state_dir, keep_paths=keep_paths)
             save_json(best_config_path, state["best"]["config"])
             save_json(state_path, state)
 
@@ -886,7 +932,7 @@ def run(args):
                         force_baseline=run_baseline_first,
                     )
                     run_baseline_first = False
-                    init_checkpoint = best_checkpoint_for_parent(script_dir, parent)
+                    init_checkpoint = best_checkpoint_for_parent(state_dir, parent)
                     candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
                         script_dir=script_dir,
                         logs_dir=logs_dir,
@@ -896,10 +942,11 @@ def run(args):
                         iteration=state["iteration"],
                         candidate=candidate_config,
                         data_root=args.data_root,
+                        model_storage_root=state_dir,
                         init_checkpoint=init_checkpoint,
                     )
                     if should_retry_without_pretrained(returncode, log_text, candidate_config):
-                        discard_candidate_model(script_dir, candidate_name)
+                        discard_candidate_model(state_dir, candidate_name)
                         candidate_config["pretrained"] = 0
                         mutations.append("pretrained:1->0(auto-retry)")
                         candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
@@ -911,6 +958,7 @@ def run(args):
                             iteration=state["iteration"],
                             candidate=candidate_config,
                             data_root=args.data_root,
+                            model_storage_root=state_dir,
                             init_checkpoint=init_checkpoint,
                         )
 
@@ -939,13 +987,13 @@ def run(args):
 
                 if status == "keep":
                     promote_candidate_model(
-                        script_dir,
+                        state_dir,
                         candidate_name,
                         candidate_config,
                         candidate_auc,
                     )
                 else:
-                    discard_candidate_model(script_dir, candidate_name)
+                    discard_candidate_model(state_dir, candidate_name)
 
                 row = {
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

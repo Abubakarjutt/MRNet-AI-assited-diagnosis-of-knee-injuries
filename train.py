@@ -294,6 +294,11 @@ def run(args):
     model = utils.maybe_channels_last(model, device)
     model.to(device)
 
+     # Log model architecture info for tracking
+    num_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: {args.model_type}, Parameters: {num_params/1e6:.2f}M, Trainable: {trainable_params/1e6:.2f}M")
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -309,6 +314,7 @@ def run(args):
     patience_counter = 0
     global_train_step = 0
     global_val_step = 0
+    model_output_dir = os.path.abspath(os.environ.get("MRNET_MODEL_DIR", "models"))
 
     num_epochs = args.epochs
     patience = args.patience
@@ -374,15 +380,15 @@ def run(args):
             best_val_auc = float(val_auc)
             best_epoch = epoch + 1
             if bool(args.save_model):
-                os.makedirs("models", exist_ok=True)
+                os.makedirs(model_output_dir, exist_ok=True)
                 file_name = (
                     f"model_{run_name}_{args.model_type}_val_auc_{val_auc:0.4f}_"
                     f"train_auc_{train_auc:0.4f}_epoch_{epoch + 1}.pth"
                 )
-                for existing_file in os.listdir("models"):
+                for existing_file in os.listdir(model_output_dir):
                     if run_name in existing_file:
-                        os.remove(os.path.join("models", existing_file))
-                torch.save(model.state_dict(), os.path.join("models", file_name))
+                        os.remove(os.path.join(model_output_dir, existing_file))
+                torch.save(model.state_dict(), os.path.join(model_output_dir, file_name))
                 print(f"Best model saved with validation AUC: {val_auc:.4f}")
 
         if val_loss < best_val_loss:
@@ -403,6 +409,20 @@ def run(args):
     num_params = sum(parameter.numel() for parameter in model.parameters())
     avg_epoch_time = float(np.mean(avg_epoch_seconds)) if avg_epoch_seconds else float("nan")
 
+     # Compute model complexity score for autoresearch tracking
+    model_complexity = 0.0
+    if args.model_type == "mobilenet_v3_small":
+        model_complexity = 0.0
+    elif args.model_type == "resnet18":
+        model_complexity = 0.2
+    elif args.model_type == "efficientnet_b0":
+        model_complexity = 0.4
+
+    pooling_complexity = {"max": 0.0, "mean": 0.0, "lse": 0.2, "gem": 0.3, "attention": 0.5}.get(args.pooling, 0.3)
+    fusion_complexity = 0.2 * max(int(args.fusion_depth) - 1, 0)
+    gate_complexity = 0.15 * (1 if args.fusion_gate == "se" else 0)
+    total_complexity = model_complexity + pooling_complexity + fusion_complexity + gate_complexity
+
     print("---")
     print(f"best_val_auc:       {best_val_auc:.6f}")
     print(f"best_val_loss:      {best_val_loss:.6f}")
@@ -412,6 +432,7 @@ def run(args):
     print(f"best_epoch:         {best_epoch}")
     print(f"num_params_M:       {num_params / 1e6:.2f}")
     print(f"model_type:         {args.model_type}")
+    print(f"model_complexity:   {total_complexity:.2f}")
     print(f"device:             {device.type}")
 
 

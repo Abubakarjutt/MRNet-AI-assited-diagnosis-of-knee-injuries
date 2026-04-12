@@ -9,10 +9,43 @@ import torch.utils.data as data
 
 PLANES = ("sagittal", "coronal", "axial")
 TASKS = ("abnormal", "acl", "meniscus")
+REQUIRED_SPLIT_FILES = tuple(
+    f"{split}-{task}.csv"
+    for split in ("train", "valid")
+    for task in TASKS
+)
 
 
 def _zero_pad_exam_id(exam_id):
     return f"{int(exam_id):04d}"
+
+
+def _is_dataset_root(root_dir):
+    required_paths = [os.path.join(root_dir, name) for name in REQUIRED_SPLIT_FILES]
+    split_dirs = [
+        os.path.join(root_dir, split, plane)
+        for split in ("train", "valid")
+        for plane in PLANES
+    ]
+    return all(os.path.isfile(path) for path in required_paths) and all(os.path.isdir(path) for path in split_dirs)
+
+
+def resolve_dataset_root(root_dir):
+    root_dir = os.path.abspath(os.path.expanduser(root_dir))
+    candidates = [root_dir, os.path.join(root_dir, "MRNet-v1.0")]
+    for candidate in candidates:
+        if _is_dataset_root(candidate):
+            return candidate
+
+    missing = []
+    for candidate in candidates:
+        missing.extend(
+            path for path in [os.path.join(candidate, name) for name in REQUIRED_SPLIT_FILES] if not os.path.isfile(path)
+        )
+    preview = ", ".join(missing[:4]) if missing else "required CSV files and split directories"
+    raise FileNotFoundError(
+        f"MRNet dataset root is invalid: {root_dir}. Looked in {candidates}. Missing examples: {preview}"
+    )
 
 
 def _read_split_records(root_dir, split):
@@ -40,6 +73,7 @@ class MRDataset(data.Dataset):
     def __init__(self, root_dir, plane, train=True, transform=None, weights=None, mmap=True):
         super().__init__()
         split = "train" if train else "valid"
+        root_dir = resolve_dataset_root(root_dir)
         self.records = _read_split_records(root_dir, split)
         self.plane = plane
         self.transform = transform
@@ -79,6 +113,7 @@ class MRMultiPlaneDataset(data.Dataset):
     def __init__(self, root_dir, train=True, planes=PLANES, mmap=True, cache_size=32):
         super().__init__()
         split = "train" if train else "valid"
+        root_dir = resolve_dataset_root(root_dir)
         self.root_dir = root_dir
         self.split = split
         self.planes = tuple(planes)
