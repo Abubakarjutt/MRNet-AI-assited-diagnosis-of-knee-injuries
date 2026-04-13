@@ -17,6 +17,7 @@ from copy import deepcopy
 from datetime import datetime
 
 from research_priors import RESEARCH_PRIORS
+from research_controller import propose_next_experiment, write_research_memo
 
 
 SUMMARY_PATTERNS = {
@@ -45,6 +46,7 @@ RESULT_COLUMNS = [
     "mutations",
     "config_path",
     "log_file",
+    "research_memo",
 ]
 
 SEARCH_SPACE = {
@@ -728,7 +730,7 @@ def load_result_config(row):
         return None
 
 
-def is_simpler_candidate(parent, candidate_config, candidate_num_params):
+def is_simpler_candidate(parent, candidate_config, candidate_num_params, candidate_complexity=None):
     parent_num_params = parent.get("num_params_M")
     if (
         parent_num_params is not None
@@ -742,17 +744,18 @@ def is_simpler_candidate(parent, candidate_config, candidate_num_params):
         "complexity_score",
         config_complexity_score(parent.get("config", {})),
     )
-    candidate_complexity = config_complexity_score(candidate_config)
+    if candidate_complexity is None:
+        candidate_complexity = config_complexity_score(candidate_config)
     return candidate_complexity < parent_complexity
 
 
-def is_better_objective_candidate(parent, candidate_auc, candidate_config, candidate_num_params):
+def is_better_objective_candidate(parent, candidate_auc, candidate_config, candidate_num_params, candidate_complexity=None):
     parent_auc = float_or_default(parent.get("best_val_auc"), 0.0)
     if candidate_auc > parent_auc + AUC_IMPROVEMENT_EPS:
         return True
 
     if abs(candidate_auc - parent_auc) <= AUC_TIE_EPS and is_simpler_candidate(
-        parent, candidate_config, candidate_num_params
+        parent, candidate_config, candidate_num_params, candidate_complexity
     ):
         return True
 
@@ -859,6 +862,25 @@ def write_best_only_manifest(state_dir, best_name):
     save_json(manifest_path, manifest)
 
 
+def controller_memo_path(research_dir, candidate_name):
+    return os.path.join(research_dir, f"{candidate_name}.json")
+
+
+def summarize_outcome(status, candidate_name, candidate_auc, summary, config_path, log_path):
+    return {
+        "candidate_name": candidate_name,
+        "status": status,
+        "best_val_auc": candidate_auc,
+        "best_val_loss": summary.get("best_val_loss"),
+        "training_seconds": summary.get("training_seconds"),
+        "epochs_ran": summary.get("epochs_ran"),
+        "num_params_M": summary.get("num_params_M"),
+        "model_complexity": summary.get("model_complexity"),
+        "config_path": config_path,
+        "log_path": log_path,
+    }
+
+
 def run(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     state_dir = os.path.expanduser(args.state_dir)
@@ -867,10 +889,12 @@ def run(args):
     config_dir = os.path.join(state_dir, "configs")
     cache_dir = os.path.join(state_dir, "torch_cache")
     temp_root_dir = os.path.join(state_dir, "tmp")
+    research_dir = os.path.join(state_dir, "research_memos")
     ensure_dir(logs_dir)
     ensure_dir(config_dir)
     ensure_dir(cache_dir)
     ensure_dir(temp_root_dir)
+    ensure_dir(research_dir)
     ensure_dir(model_dir(state_dir))
 
     results_path = os.path.join(state_dir, "results.tsv")
@@ -924,13 +948,37 @@ def run(args):
                 parent = deepcopy(state["best"])
                 parent["research"] = state["research"]
                 try:
-                    candidate_config, mutations, prior = select_next_candidate(
-                        parent=parent,
-                        args=args,
-                        rng=rng,
-                        seen_signatures=seen_signatures,
-                        force_baseline=run_baseline_first,
-                    )
+                    if run_baseline_first:
+                        candidate_config, mutations, prior = make_baseline_candidate(args)
+                        controller_proposal = {
+                            "config": candidate_config,
+                            "mutations": list(mutations) + ["controller:baseline_bootstrap"],
+                            "controller_name": "baseline_bootstrap",
+                            "analysis": ["Fresh state detected, so the loop is running a baseline anchor experiment before invoking the research controller."],
+                            "hypothesis": "Establish a stable baseline before deeper research-guided iterations.",
+                            "sources": [],
+                            "context": {},
+                        }
+                        mutations = list(controller_proposal["mutations"])
+                    else:
+                        controller_proposal = propose_next_experiment(
+                            iteration=state["iteration"],
+                            parent=parent,
+                            result_rows=result_rows + run_rows,
+                            research_state=state["research"],
+                            search_space=SEARCH_SPACE,
+                            default_config=DEFAULT_CONFIG,
+                            research_priors=RESEARCH_PRIORS,
+                            seen_signatures=seen_signatures,
+                            max_duplicate_retries=MAX_DUPLICATE_RETRIES,
+                            seed=args.seed + int(state["iteration"]),
+                            agent_command=args.research_agent_cmd,
+                        )
+                        candidate_config = sanitize_search_config(controller_proposal["config"])
+                        candidate_config = apply_runtime_overrides(candidate_config, args)
+                        candidate_config = sanitize_search_config(candidate_config)
+                        mutations = list(controller_proposal.get("mutations") or [])
+                        prior = {"name": controller_proposal.get("controller_name", "research_agent") }
                     run_baseline_first = False
                     init_checkpoint = best_checkpoint_for_parent(state_dir, parent)
                     candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
@@ -972,6 +1020,15 @@ def run(args):
                     )
                 except Exception:
                     prior = {"name": "controller_exception"}
+                    controller_proposal = {
+                        "config": parent["config"],
+                        "mutations": ["controller_exception"],
+                        "controller_name": "controller_exception",
+                        "analysis": ["The research controller failed before launching the candidate. The loop recorded the traceback and kept the current best configuration."],
+                        "hypothesis": "Controller failure fallback.",
+                        "sources": [],
+                        "context": {},
+                    }
                     mutations = ["controller_exception"]
                     candidate_config = sanitize_search_config(parent["config"])
                     candidate_name = f"iter{state['iteration']:03d}_controller_exception"
@@ -995,6 +1052,20 @@ def run(args):
                 else:
                     discard_candidate_model(state_dir, candidate_name)
 
+                research_memo = controller_memo_path(research_dir, candidate_name)
+                write_research_memo(
+                    research_memo,
+                    controller_proposal,
+                    outcome=summarize_outcome(
+                        status=status,
+                        candidate_name=candidate_name,
+                        candidate_auc=candidate_auc,
+                        summary=summary,
+                        config_path=config_path,
+                        log_path=log_path,
+                    ),
+                )
+
                 row = {
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "iteration": state["iteration"],
@@ -1011,6 +1082,7 @@ def run(args):
                     "mutations": ", ".join(mutations),
                     "config_path": config_path,
                     "log_file": log_path,
+                    "research_memo": research_memo,
                 }
                 append_result(results_path, row)
                 run_rows.append(row)
@@ -1086,6 +1158,12 @@ def parse_args():
     parser.add_argument("--pretrained", type=int, choices=[0, 1], default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--min_free_gb", type=float, default=40.0)
+    parser.add_argument(
+        "--research_agent_cmd",
+        type=str,
+        default=os.environ.get("AUTORESEARCH_RESEARCH_AGENT_CMD"),
+        help="Optional external command that receives JSON context on stdin and returns a JSON proposal for the next experiment.",
+    )
     return parser.parse_args()
 
 

@@ -129,8 +129,10 @@ This loop is persistent and architecture-improving:
 
 - it runs the baseline first on a fresh state directory
 - it then loads the current best config from `~/.mrnet_autoresearch`
-- mutates a constrained architecture/training search surface
-- runs a fixed-budget experiment with a fixed evaluation harness
+- after every experiment it writes a research memo, analyzes recent wins and failures, and proposes the next architecture
+- the built-in controller mixes result-history analysis with curated literature priors instead of blindly cycling the static prior table
+- you can optionally plug in an external research agent with `AUTORESEARCH_RESEARCH_AGENT_CMD` or `--research_agent_cmd`
+- it runs a fixed-budget experiment with a fixed evaluation harness
 - uses validation AUC as the primary objective
 - uses simplicity only as a tie-breaker when AUC is effectively identical
 
@@ -152,6 +154,12 @@ The full run history is persisted in:
 
 ```bash
 ~/.mrnet_autoresearch/results.tsv
+```
+
+Per-candidate controller memos are also persisted in:
+
+```bash
+~/.mrnet_autoresearch/research_memos/<candidate>.json
 ```
 
 `experiment_runner.py` still exists for fixed preset batches, but `autoresearch_loop.py` is the continuous-improvement path.
