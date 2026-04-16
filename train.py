@@ -27,7 +27,7 @@ except ImportError:
 import advanced_vit
 import lightweight_models
 import utils
-from dataloader import MRMultiPlaneDataset
+from dataloader import MRMultiPlaneDataset, MRVolumeAugmentor
 
 
 torch.set_float32_matmul_precision("high")
@@ -70,6 +70,16 @@ def build_dataloader(dataset, shuffle, args):
 
     return torch.utils.data.DataLoader(dataset, **loader_kwargs)
 
+
+
+
+def build_train_augmentor(args):
+    return MRVolumeAugmentor(
+        policy=args.aug_policy,
+        noise_std=args.aug_noise_std,
+        cutout_frac=args.aug_cutout_frac,
+        slice_dropout=args.aug_slice_dropout,
+    )
 
 def prepare_inputs(volumes, device, args):
     channels_last = bool(args.channels_last)
@@ -278,6 +288,7 @@ def run(args):
         train=True,
         mmap=bool(args.mmap),
         cache_size=args.cache_size,
+        transform=build_train_augmentor(args),
     )
     val_dataset = MRMultiPlaneDataset(
         data_root,
@@ -419,9 +430,10 @@ def run(args):
         model_complexity = 0.4
 
     pooling_complexity = {"max": 0.0, "mean": 0.0, "lse": 0.2, "gem": 0.3, "attention": 0.5}.get(args.pooling, 0.3)
+    augmentation_complexity = {"none": 0.0, "light": 0.05, "strong": 0.12, "knee_mri": 0.18}.get(args.aug_policy, 0.08)
     fusion_complexity = 0.2 * max(int(args.fusion_depth) - 1, 0)
     gate_complexity = 0.15 * (1 if args.fusion_gate == "se" else 0)
-    total_complexity = model_complexity + pooling_complexity + fusion_complexity + gate_complexity
+    total_complexity = model_complexity + pooling_complexity + fusion_complexity + gate_complexity + augmentation_complexity
 
     print("---")
     print(f"best_val_auc:       {best_val_auc:.6f}")
@@ -517,6 +529,16 @@ def parse_arguments():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--cache_size", type=int, default=32)
+    parser.add_argument(
+        "--aug_policy",
+        type=str,
+        default="none",
+        choices=["none", "light", "strong", "knee_mri"],
+        help="Training-time augmentation policy searched by the autoresearch loop.",
+    )
+    parser.add_argument("--aug_noise_std", type=float, default=0.0)
+    parser.add_argument("--aug_cutout_frac", type=float, default=0.0)
+    parser.add_argument("--aug_slice_dropout", type=float, default=0.0)
     parser.add_argument("--mmap", type=int, choices=[0, 1], default=1)
     parser.add_argument("--amp", type=int, choices=[0, 1], default=1)
     parser.add_argument("--channels_last", type=int, choices=[0, 1], default=1)

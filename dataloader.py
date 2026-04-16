@@ -2,6 +2,7 @@ import os
 from collections import OrderedDict
 
 import numpy as np
+import random
 import pandas as pd
 import torch
 import torch.utils.data as data
@@ -101,6 +102,68 @@ class MRDataset(data.Dataset):
         return tensor, label, self.weights
 
 
+
+
+class MRVolumeAugmentor:
+    def __init__(self, policy="none", noise_std=0.0, cutout_frac=0.0, slice_dropout=0.0):
+        self.policy = policy
+        self.noise_std = max(float(noise_std), 0.0)
+        self.cutout_frac = min(max(float(cutout_frac), 0.0), 0.5)
+        self.slice_dropout = min(max(float(slice_dropout), 0.0), 0.5)
+
+    def __call__(self, volume):
+        if self.policy == "none":
+            return volume
+
+        augmented = volume.clone()
+        if self.policy in {"light", "strong", "knee_mri"}:
+            augmented = self._random_flip(augmented)
+            augmented = self._random_intensity_shift(augmented)
+
+        if self.policy in {"strong", "knee_mri"}:
+            augmented = self._random_noise(augmented)
+            augmented = self._random_cutout(augmented)
+            augmented = self._random_slice_dropout(augmented)
+
+        return augmented
+
+    def _random_flip(self, volume):
+        if random.random() < 0.5:
+            return torch.flip(volume, dims=[2])
+        return volume
+
+    def _random_intensity_shift(self, volume):
+        scale = 1.0 + random.uniform(-0.08, 0.08)
+        bias = random.uniform(-0.08, 0.08)
+        return volume * scale + bias
+
+    def _random_noise(self, volume):
+        if self.noise_std <= 0:
+            return volume
+        noise = torch.randn_like(volume) * self.noise_std
+        return volume + noise
+
+    def _random_cutout(self, volume):
+        if self.cutout_frac <= 0 or random.random() >= 0.5:
+            return volume
+        _, height, width = volume.shape
+        cut_h = max(1, int(height * self.cutout_frac))
+        cut_w = max(1, int(width * self.cutout_frac))
+        top = random.randint(0, max(0, height - cut_h))
+        left = random.randint(0, max(0, width - cut_w))
+        volume[:, top:top + cut_h, left:left + cut_w] = 0
+        return volume
+
+    def _random_slice_dropout(self, volume):
+        if self.slice_dropout <= 0 or volume.shape[0] <= 4:
+            return volume
+        mask = torch.rand(volume.shape[0]) < self.slice_dropout
+        if mask.all():
+            mask[random.randrange(volume.shape[0])] = False
+        volume[mask] = 0
+        return volume
+
+
 def _compute_class_weights(labels):
     positive_counts = labels.sum(axis=0)
     negative_counts = labels.shape[0] - positive_counts
@@ -110,7 +173,7 @@ def _compute_class_weights(labels):
 
 
 class MRMultiPlaneDataset(data.Dataset):
-    def __init__(self, root_dir, train=True, planes=PLANES, mmap=True, cache_size=32):
+    def __init__(self, root_dir, train=True, planes=PLANES, mmap=True, cache_size=32, transform=None):
         super().__init__()
         split = "train" if train else "valid"
         root_dir = resolve_dataset_root(root_dir)
@@ -130,6 +193,7 @@ class MRMultiPlaneDataset(data.Dataset):
             for plane in self.planes
         }
         self.cache_size = max(int(cache_size), 0)
+        self.transform = transform
         self._cache = OrderedDict()
 
     def __len__(self):
@@ -155,5 +219,7 @@ class MRMultiPlaneDataset(data.Dataset):
 
     def __getitem__(self, index):
         volumes = tuple(self._load_volume(plane, index) for plane in self.planes)
+        if self.transform is not None:
+            volumes = tuple(self.transform(volume) for volume in volumes)
         label = torch.from_numpy(self.labels[index])
         return volumes, label, self.weights, self.exam_ids[index]

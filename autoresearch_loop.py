@@ -62,6 +62,10 @@ SEARCH_SPACE = {
     "image_size": [160, 192, 224],
     "cache_size": [16, 32, 48],
     "num_workers": [2, 4],
+    "aug_policy": ["none", "light", "strong", "knee_mri"],
+    "aug_noise_std": [0.0, 0.01, 0.02, 0.04],
+    "aug_cutout_frac": [0.0, 0.08, 0.12, 0.18],
+    "aug_slice_dropout": [0.0, 0.03, 0.06, 0.1],
 }
 
 DEFAULT_CONFIG = {
@@ -77,6 +81,10 @@ DEFAULT_CONFIG = {
     "image_size": 224,
     "cache_size": 32,
     "num_workers": 2,
+    "aug_policy": "none",
+    "aug_noise_std": 0.0,
+    "aug_cutout_frac": 0.0,
+    "aug_slice_dropout": 0.0,
     "epochs": 8,
     "patience": 3,
     "amp": 1,
