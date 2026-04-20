@@ -132,6 +132,7 @@ This loop is persistent and architecture-improving:
 - after every experiment it writes a research memo, analyzes recent wins and failures, and proposes the next architecture
 - the built-in controller mixes result-history analysis with curated literature priors instead of blindly cycling the static prior table
 - you can optionally plug in an external research agent with `AUTORESEARCH_RESEARCH_AGENT_CMD` or `--research_agent_cmd`
+- each experiment starts from scratch instead of warm-starting from the previous best checkpoint
 - it runs a fixed-budget experiment with a fixed evaluation harness
 - uses validation AUC as the primary objective
 - uses simplicity only as a tie-breaker when AUC is effectively identical
@@ -164,7 +165,7 @@ Per-candidate controller memos are also persisted in:
 
 `experiment_runner.py` still exists for fixed preset batches, but `autoresearch_loop.py` is the continuous-improvement path.
 
-Default per-candidate budget: `60` minutes.
+Default per-candidate budget: `60` minutes, including scheduled workflow runs unless explicitly overridden.
 
 ## GitHub Actions
 

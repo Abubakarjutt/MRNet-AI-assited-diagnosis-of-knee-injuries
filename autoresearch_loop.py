@@ -404,7 +404,7 @@ def apply_research_prior(base_config, prior, rng):
     return candidate, mutations
 
 
-def build_train_command(prefix_name, config_path, data_root, init_checkpoint=None):
+def build_train_command(prefix_name, config_path, data_root):
     command = [
         sys.executable,
         "train.py",
@@ -415,8 +415,6 @@ def build_train_command(prefix_name, config_path, data_root, init_checkpoint=Non
         "--search_config",
         config_path,
     ]
-    if init_checkpoint:
-        command.extend(["--init_checkpoint", init_checkpoint])
     return command
 
 
@@ -464,24 +462,6 @@ def save_best_model_meta(storage_root, metadata):
     save_json(best_model_meta_path(storage_root), metadata)
 
 
-def best_checkpoint_for_parent(storage_root, parent):
-    checkpoint_path = best_model_path(storage_root)
-    meta = load_best_model_meta(storage_root)
-    if not os.path.isfile(checkpoint_path):
-        return None
-
-    if not meta:
-        return None
-
-    if meta.get("candidate_name") != parent.get("name"):
-        return None
-
-    if meta.get("config_signature") != config_signature(parent.get("config", {})):
-        return None
-
-    return checkpoint_path
-
-
 def promote_candidate_model(storage_root, candidate_name, candidate_config, candidate_auc):
     paths = candidate_model_paths(storage_root, candidate_name)
     if not paths:
@@ -524,7 +504,6 @@ def run_candidate(
     candidate,
     data_root,
     model_storage_root,
-    init_checkpoint=None,
 ):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     candidate_name = f"iter{iteration:03d}_{timestamp}"
@@ -534,7 +513,7 @@ def run_candidate(
     execution_candidate["save_model"] = 1
     save_json(config_path, execution_candidate)
 
-    command = build_train_command(candidate_name, config_path, data_root, init_checkpoint=init_checkpoint)
+    command = build_train_command(candidate_name, config_path, data_root)
     env = os.environ.copy()
     env["TORCH_HOME"] = cache_dir
     env["MRNET_MODEL_DIR"] = model_dir(model_storage_root)
@@ -988,7 +967,6 @@ def run(args):
                         mutations = list(controller_proposal.get("mutations") or [])
                         prior = {"name": controller_proposal.get("controller_name", "research_agent") }
                     run_baseline_first = False
-                    init_checkpoint = best_checkpoint_for_parent(state_dir, parent)
                     candidate_name, config_path, log_path, returncode, summary, log_text = run_candidate(
                         script_dir=script_dir,
                         logs_dir=logs_dir,
@@ -999,7 +977,6 @@ def run(args):
                         candidate=candidate_config,
                         data_root=args.data_root,
                         model_storage_root=state_dir,
-                        init_checkpoint=init_checkpoint,
                     )
                     if should_retry_without_pretrained(returncode, log_text, candidate_config):
                         discard_candidate_model(state_dir, candidate_name)
@@ -1015,7 +992,6 @@ def run(args):
                             candidate=candidate_config,
                             data_root=args.data_root,
                             model_storage_root=state_dir,
-                            init_checkpoint=init_checkpoint,
                         )
 
                     candidate_auc = float_or_default(summary["best_val_auc"])
