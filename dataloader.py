@@ -105,25 +105,39 @@ class MRDataset(data.Dataset):
 
 
 class MRVolumeAugmentor:
-    def __init__(self, policy="none", noise_std=0.0, cutout_frac=0.0, slice_dropout=0.0):
+    def __init__(
+        self,
+        policy="none",
+        noise_std=0.0,
+        cutout_frac=0.0,
+        slice_dropout=0.0,
+        gamma_jitter=0.0,
+        spatial_shift_frac=0.0,
+    ):
         self.policy = policy
         self.noise_std = max(float(noise_std), 0.0)
         self.cutout_frac = min(max(float(cutout_frac), 0.0), 0.5)
         self.slice_dropout = min(max(float(slice_dropout), 0.0), 0.5)
+        self.gamma_jitter = min(max(float(gamma_jitter), 0.0), 0.5)
+        self.spatial_shift_frac = min(max(float(spatial_shift_frac), 0.0), 0.2)
 
     def __call__(self, volume):
         if self.policy == "none":
             return volume
 
         augmented = volume.clone()
-        if self.policy in {"light", "strong", "knee_mri"}:
+        if self.policy in {"light", "strong", "knee_mri", "knee_mri_plus"}:
             augmented = self._random_flip(augmented)
             augmented = self._random_intensity_shift(augmented)
 
-        if self.policy in {"strong", "knee_mri"}:
+        if self.policy in {"strong", "knee_mri", "knee_mri_plus"}:
             augmented = self._random_noise(augmented)
             augmented = self._random_cutout(augmented)
             augmented = self._random_slice_dropout(augmented)
+
+        if self.policy == "knee_mri_plus":
+            augmented = self._random_gamma(augmented)
+            augmented = self._random_spatial_shift(augmented)
 
         return augmented
 
@@ -162,6 +176,35 @@ class MRVolumeAugmentor:
             mask[random.randrange(volume.shape[0])] = False
         volume[mask] = 0
         return volume
+
+    def _random_gamma(self, volume):
+        if self.gamma_jitter <= 0 or random.random() >= 0.5:
+            return volume
+        gamma = 1.0 + random.uniform(-self.gamma_jitter, self.gamma_jitter)
+        lower = torch.quantile(volume, 0.01)
+        upper = torch.quantile(volume, 0.99)
+        scaled = torch.clamp((volume - lower) / (upper - lower + 1e-6), 0.0, 1.0)
+        adjusted = scaled.pow(gamma) * (upper - lower) + lower
+        return adjusted
+
+    def _random_spatial_shift(self, volume):
+        if self.spatial_shift_frac <= 0 or random.random() >= 0.5:
+            return volume
+        _, height, width = volume.shape
+        max_dy = max(1, int(height * self.spatial_shift_frac))
+        max_dx = max(1, int(width * self.spatial_shift_frac))
+        dy = random.randint(-max_dy, max_dy)
+        dx = random.randint(-max_dx, max_dx)
+        shifted = torch.roll(volume, shifts=(dy, dx), dims=(1, 2))
+        if dy > 0:
+            shifted[:, :dy, :] = 0
+        elif dy < 0:
+            shifted[:, dy:, :] = 0
+        if dx > 0:
+            shifted[:, :, :dx] = 0
+        elif dx < 0:
+            shifted[:, :, dx:] = 0
+        return shifted
 
 
 def _compute_class_weights(labels):

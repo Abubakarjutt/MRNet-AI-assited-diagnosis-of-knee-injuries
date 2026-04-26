@@ -117,6 +117,36 @@ python train.py --prefix_name mobile_trial --model_type mobilenet_v3_small
 python train.py --prefix_name effb0_trial --model_type efficientnet_b0
 ```
 
+New research-oriented options now available in `train.py`:
+
+- `--plane_fusion plane_transformer` for stronger cross-plane token interaction
+- `--val_tta_mode flip` for validation-time flip ensembling
+- `--loss_type focal --label_smoothing ... --ema_decay ...` for better regularization on imbalanced data
+- `--aug_policy knee_mri_plus` for stronger MRI-safe augmentation
+- `--init_checkpoint <ssl_checkpoint>` for warm-starting from domain-specific self-supervised pretraining
+
+### Self-Supervised Pretraining
+
+You can pretrain the encoder on unlabeled MRNet slices and then fine-tune it with `train.py`:
+
+```bash
+python pretrain_ssl.py \
+  --prefix_name ssl_mobile_trial \
+  --model_type mobilenet_v3_small \
+  --pretrained 1 \
+  --data_root MRNet-v1.0
+
+python train.py \
+  --prefix_name ssl_finetune_trial \
+  --model_type mobilenet_v3_small \
+  --plane_fusion plane_transformer \
+  --val_tta_mode flip \
+  --aug_policy knee_mri_plus \
+  --loss_type focal \
+  --ema_decay 0.995 \
+  --init_checkpoint ssl_pretrain_outputs/ssl_mobile_trial_best_ssl.pth
+```
+
 ## Autoresearch-Style Loop
 
 The main autoresearch path is now:

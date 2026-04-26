@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from sklearn import metrics
 
 try:
@@ -79,6 +80,8 @@ def build_train_augmentor(args):
         noise_std=args.aug_noise_std,
         cutout_frac=args.aug_cutout_frac,
         slice_dropout=args.aug_slice_dropout,
+        gamma_jitter=args.aug_gamma_jitter,
+        spatial_shift_frac=args.aug_spatial_shift_frac,
     )
 
 def prepare_inputs(volumes, device, args):
@@ -95,6 +98,24 @@ def prepare_inputs(volumes, device, args):
     return sagittal, coronal, axial
 
 
+def augment_eval_volumes(volumes, mode):
+    if mode == "flip":
+        return tuple(torch.flip(volume, dims=[2]) for volume in volumes)
+    raise ValueError(f"Unsupported eval TTA mode: {mode}")
+
+
+def forward_with_eval_policy(model, volumes, device, args):
+    eval_volumes = [volumes]
+    if args.val_tta_mode != "none":
+        eval_volumes.append(augment_eval_volumes(volumes, args.val_tta_mode))
+
+    logits = []
+    for variant in eval_volumes:
+        sagittal, coronal, axial = prepare_inputs(variant, device, args)
+        logits.append(model(sagittal, coronal, axial))
+    return torch.stack(logits, dim=0).mean(dim=0)
+
+
 def compute_auc(y_true, y_pred):
     try:
         if len(np.unique(y_true)) > 1:
@@ -102,6 +123,64 @@ def compute_auc(y_true, y_pred):
     except ValueError:
         pass
     return 0.5
+
+
+class ModelEMA:
+    def __init__(self, model, decay):
+        self.decay = float(decay)
+        self.shadow = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.backup = {}
+
+    @torch.no_grad()
+    def update(self, model):
+        for name, parameter in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.shadow[name].mul_(self.decay).add_(parameter.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model):
+        self.backup = {}
+        for name, parameter in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.backup[name] = parameter.detach().clone()
+            parameter.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model):
+        for name, parameter in model.named_parameters():
+            if name in self.backup:
+                parameter.copy_(self.backup[name])
+        self.backup = {}
+
+
+def smooth_targets(label, smoothing):
+    smoothing = float(smoothing)
+    if smoothing <= 0:
+        return label
+    return label * (1.0 - smoothing) + 0.5 * smoothing
+
+
+def compute_loss(prediction, label, criterion, args):
+    target = smooth_targets(label, args.label_smoothing)
+    if args.loss_type == "bce":
+        return criterion(prediction, target)
+
+    bce = F.binary_cross_entropy_with_logits(
+        prediction,
+        target,
+        pos_weight=criterion.pos_weight,
+        reduction="none",
+    )
+    probabilities = torch.sigmoid(prediction)
+    pt = probabilities * target + (1.0 - probabilities) * (1.0 - target)
+    focal_weight = (1.0 - pt).pow(args.focal_gamma)
+    return (focal_weight * bce).mean()
 
 
 def iterate_epoch(
@@ -117,6 +196,7 @@ def iterate_epoch(
     args,
     is_train,
     global_step,
+    ema=None,
 ):
     if is_train:
         model.train()
@@ -143,13 +223,18 @@ def iterate_epoch(
 
         with torch.set_grad_enabled(is_train):
             with amp_context:
-                prediction = model(sagittal, coronal, axial)
-                loss = criterion(prediction, label)
+                if is_train:
+                    prediction = model(sagittal, coronal, axial)
+                else:
+                    prediction = forward_with_eval_policy(model, volumes, device, args)
+                loss = compute_loss(prediction, label, criterion, args)
 
             if is_train:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                if ema is not None:
+                    ema.update(model)
 
         probas = torch.sigmoid(prediction).detach().cpu().numpy().reshape(-1)
         truth = label.detach().cpu().numpy().reshape(-1)
@@ -200,6 +285,8 @@ def build_model(args):
             hidden_dim=args.hidden_dim,
             fusion_depth=args.fusion_depth,
             fusion_gate=args.fusion_gate,
+            plane_fusion=args.plane_fusion,
+            plane_transformer_heads=args.plane_transformer_heads,
         )
 
     return model
@@ -318,6 +405,7 @@ def run(args):
         threshold=1e-4,
     )
     criterion = nn.BCEWithLogitsLoss(pos_weight=train_dataset.weights.to(device))
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
 
     best_val_loss = float("inf")
     best_val_auc = 0.0
@@ -355,8 +443,11 @@ def run(args):
             args=args,
             is_train=True,
             global_step=global_train_step,
+            ema=ema,
         )
 
+        if ema is not None:
+            ema.apply_to(model)
         val_loss, val_auc, val_y_trues, val_y_preds, global_val_step = iterate_epoch(
             model=model,
             loader=val_loader,
@@ -371,6 +462,8 @@ def run(args):
             is_train=False,
             global_step=global_val_step,
         )
+        if ema is not None:
+            ema.restore(model)
 
         scheduler.step(val_loss)
 
@@ -430,10 +523,20 @@ def run(args):
         model_complexity = 0.4
 
     pooling_complexity = {"max": 0.0, "mean": 0.0, "lse": 0.2, "gem": 0.3, "attention": 0.5}.get(args.pooling, 0.3)
-    augmentation_complexity = {"none": 0.0, "light": 0.05, "strong": 0.12, "knee_mri": 0.18}.get(args.aug_policy, 0.08)
+    augmentation_complexity = {"none": 0.0, "light": 0.05, "strong": 0.12, "knee_mri": 0.18, "knee_mri_plus": 0.24}.get(args.aug_policy, 0.08)
     fusion_complexity = 0.2 * max(int(args.fusion_depth) - 1, 0)
     gate_complexity = 0.15 * (1 if args.fusion_gate == "se" else 0)
-    total_complexity = model_complexity + pooling_complexity + fusion_complexity + gate_complexity + augmentation_complexity
+    plane_fusion_complexity = {"concat": 0.0, "plane_attention": 0.12, "plane_transformer": 0.22}.get(args.plane_fusion, 0.0)
+    tta_complexity = 0.05 if args.val_tta_mode != "none" else 0.0
+    total_complexity = (
+        model_complexity
+        + pooling_complexity
+        + fusion_complexity
+        + gate_complexity
+        + augmentation_complexity
+        + plane_fusion_complexity
+        + tta_complexity
+    )
 
     print("---")
     print(f"best_val_auc:       {best_val_auc:.6f}")
@@ -486,6 +589,14 @@ def parse_arguments():
         choices=["none", "se"],
         help="Optional fusion recalibration block for research-driven mutations.",
     )
+    parser.add_argument(
+        "--plane_fusion",
+        type=str,
+        default="concat",
+        choices=["concat", "plane_attention", "plane_transformer"],
+        help="How to combine sagittal, coronal, and axial features before classification.",
+    )
+    parser.add_argument("--plane_transformer_heads", type=int, default=4)
     parser.add_argument("--flush_history", type=int, choices=[0, 1], default=0)
     parser.add_argument("--save_model", type=int, choices=[0, 1], default=1)
     parser.add_argument("--patience", type=int, default=8)
@@ -533,12 +644,36 @@ def parse_arguments():
         "--aug_policy",
         type=str,
         default="none",
-        choices=["none", "light", "strong", "knee_mri"],
+        choices=["none", "light", "strong", "knee_mri", "knee_mri_plus"],
         help="Training-time augmentation policy searched by the autoresearch loop.",
     )
     parser.add_argument("--aug_noise_std", type=float, default=0.0)
     parser.add_argument("--aug_cutout_frac", type=float, default=0.0)
     parser.add_argument("--aug_slice_dropout", type=float, default=0.0)
+    parser.add_argument("--aug_gamma_jitter", type=float, default=0.0)
+    parser.add_argument("--aug_spatial_shift_frac", type=float, default=0.0)
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="bce",
+        choices=["bce", "focal"],
+        help="Loss function; focal keeps BCE logits but downweights easy labels.",
+    )
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help="Maintain an exponential moving average of trainable weights for validation/checkpointing.",
+    )
+    parser.add_argument(
+        "--val_tta_mode",
+        type=str,
+        default="none",
+        choices=["none", "flip"],
+        help="Validation-time test-time augmentation mode; predictions are averaged across views.",
+    )
     parser.add_argument("--mmap", type=int, choices=[0, 1], default=1)
     parser.add_argument("--amp", type=int, choices=[0, 1], default=1)
     parser.add_argument("--channels_last", type=int, choices=[0, 1], default=1)

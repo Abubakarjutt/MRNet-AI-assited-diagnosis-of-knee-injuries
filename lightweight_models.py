@@ -90,6 +90,52 @@ class SEFusionGate(nn.Module):
         return fused * self.net(fused)
 
 
+class PlaneAttentionFusion(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        hidden_dim = max(feature_dim // 2, 32)
+        self.scorer = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, plane_features):
+        planes = torch.stack(plane_features, dim=1)
+        weights = torch.softmax(self.scorer(planes), dim=1)
+        attended = planes * weights
+        return attended.reshape(attended.shape[0], -1)
+
+
+class PlaneTransformerFusion(nn.Module):
+    def __init__(self, feature_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.pre_norm = nn.LayerNorm(feature_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=feature_dim,
+            num_heads=max(1, min(num_heads, feature_dim)),
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, feature_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim * 2, feature_dim),
+        )
+        self.out_norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, plane_features):
+        planes = torch.stack(plane_features, dim=1)
+        attn_input = self.pre_norm(planes)
+        attended, _ = self.attention(attn_input, attn_input, attn_input, need_weights=False)
+        planes = planes + attended
+        planes = planes + self.ffn(planes)
+        return self.out_norm(planes).reshape(planes.shape[0], -1)
+
+
 def build_pooler(pooling, feature_dim):
     if pooling == "attention":
         return AttentionMILPool(feature_dim=feature_dim)
@@ -120,6 +166,8 @@ class FastMRNet(nn.Module):
         hidden_dim=256,
         fusion_depth=2,
         fusion_gate="none",
+        plane_fusion="concat",
+        plane_transformer_heads=4,
     ):
         super().__init__()
         self.backbone_name = backbone_name
@@ -129,8 +177,10 @@ class FastMRNet(nn.Module):
         self.projection_dim = projection_dim if projection_dim > 0 else self.feature_dim
         self.hidden_dim = hidden_dim
         self.fusion_depth = fusion_depth
+        self.plane_fusion_name = plane_fusion
         self.slice_pooler = build_pooler(pooling, self.feature_dim)
 
+        # Simpler projection when projection_dim matches feature_dim
         self.plane_projection = (
             nn.Sequential(
                 nn.LayerNorm(self.feature_dim),
@@ -142,6 +192,13 @@ class FastMRNet(nn.Module):
         )
 
         fused_dim = self.projection_dim * 3
+        self.plane_fusion = (
+            PlaneAttentionFusion(self.projection_dim)
+            if plane_fusion == "plane_attention"
+            else PlaneTransformerFusion(self.projection_dim, num_heads=plane_transformer_heads, dropout=dropout)
+            if plane_fusion == "plane_transformer"
+            else None
+        )
         self.fusion_gate = SEFusionGate(fused_dim) if fusion_gate == "se" else nn.Identity()
         self.classifier = self._build_classifier(
             fused_dim=fused_dim,
@@ -203,9 +260,10 @@ class FastMRNet(nn.Module):
         sagittal_features, coronal_features, axial_features = self._encode_planes(
             (sagittal, coronal, axial)
         )
-        fused = torch.cat(
-            [sagittal_features, coronal_features, axial_features],
-            dim=1,
-        )
+        plane_features = [sagittal_features, coronal_features, axial_features]
+        if self.plane_fusion is not None:
+            fused = self.plane_fusion(plane_features)
+        else:
+            fused = torch.cat(plane_features, dim=1)
         fused = self.fusion_gate(fused)
         return self.classifier(fused)
