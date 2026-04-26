@@ -92,7 +92,7 @@ DEFAULT_CONFIG = {
     "weight_decay": 1e-4,
     "image_size": 224,
     "cache_size": 32,
-    "num_workers": 2,
+    "num_workers": 0,
     "aug_policy": "none",
     "aug_noise_std": 0.0,
     "aug_cutout_frac": 0.0,
