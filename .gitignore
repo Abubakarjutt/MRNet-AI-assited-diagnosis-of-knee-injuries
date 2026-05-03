@@ -10,4 +10,14 @@ wheels/
 .venv
 models/
 logs/
+ssl_logs/
+full_training_outputs/
 MRNet-v1.0/
+*.pth
+*.npy
+*.npz
+*.pt
+*.ckpt
+*.onnx
+ci_results/
+.DS_Store

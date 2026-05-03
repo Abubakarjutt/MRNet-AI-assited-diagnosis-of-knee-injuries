@@ -82,6 +82,9 @@ def build_train_augmentor(args):
         slice_dropout=args.aug_slice_dropout,
         gamma_jitter=args.aug_gamma_jitter,
         spatial_shift_frac=args.aug_spatial_shift_frac,
+        bias_field_std=args.aug_bias_field_std,
+        blur_sigma=args.aug_blur_sigma,
+        motion_prob=args.aug_motion_prob,
     )
 
 def prepare_inputs(volumes, device, args):
@@ -523,7 +526,14 @@ def run(args):
         model_complexity = 0.4
 
     pooling_complexity = {"max": 0.0, "mean": 0.0, "lse": 0.2, "gem": 0.3, "attention": 0.5}.get(args.pooling, 0.3)
-    augmentation_complexity = {"none": 0.0, "light": 0.05, "strong": 0.12, "knee_mri": 0.18, "knee_mri_plus": 0.24}.get(args.aug_policy, 0.08)
+    augmentation_complexity = {
+        "none": 0.0,
+        "light": 0.05,
+        "strong": 0.12,
+        "knee_mri": 0.18,
+        "knee_mri_plus": 0.24,
+        "knee_mri_research": 0.30,
+    }.get(args.aug_policy, 0.08)
     fusion_complexity = 0.2 * max(int(args.fusion_depth) - 1, 0)
     gate_complexity = 0.15 * (1 if args.fusion_gate == "se" else 0)
     plane_fusion_complexity = {"concat": 0.0, "plane_attention": 0.12, "plane_transformer": 0.22}.get(args.plane_fusion, 0.0)
@@ -644,7 +654,7 @@ def parse_arguments():
         "--aug_policy",
         type=str,
         default="none",
-        choices=["none", "light", "strong", "knee_mri", "knee_mri_plus"],
+        choices=["none", "light", "strong", "knee_mri", "knee_mri_plus", "knee_mri_research"],
         help="Training-time augmentation policy searched by the autoresearch loop.",
     )
     parser.add_argument("--aug_noise_std", type=float, default=0.0)
@@ -652,6 +662,9 @@ def parse_arguments():
     parser.add_argument("--aug_slice_dropout", type=float, default=0.0)
     parser.add_argument("--aug_gamma_jitter", type=float, default=0.0)
     parser.add_argument("--aug_spatial_shift_frac", type=float, default=0.0)
+    parser.add_argument("--aug_bias_field_std", type=float, default=0.0)
+    parser.add_argument("--aug_blur_sigma", type=float, default=0.0)
+    parser.add_argument("--aug_motion_prob", type=float, default=0.0)
     parser.add_argument(
         "--loss_type",
         type=str,

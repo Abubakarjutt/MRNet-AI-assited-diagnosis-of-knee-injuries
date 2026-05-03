@@ -1,133 +1,221 @@
-# MRNet: AI-Assisted Diagnosis of Knee Injuries
+# MRNet Knee MRI Research Pipeline
 
-This repository contains an implementation of the research paper [MRNet: Deep-learning-assisted diagnosis for knee magnetic resonance](https://stanfordmlgroup.github.io/projects/mrnet/).
+Research-oriented training and autoresearch pipeline for multi-plane knee MRI classification on the [MRNet dataset](https://stanfordmlgroup.github.io/competitions/mrnet/).
 
-## Project Overview
+This repository has been shaped for iterative model research on Apple Silicon and self-hosted GitHub Actions runners. It includes:
 
-This project trains a single end-to-end model over all three MRI planes instead of training separate models per plane. The current codebase now supports both the original heavier transformer-style path and a faster autoresearch-oriented path built around lighter shared encoders, short experiment budgets, and Apple Silicon friendly preprocessing.
+- multi-plane exam-level training
+- lightweight shared encoders for fast experimentation
+- cross-plane fusion variants
+- self-supervised pretraining support
+- MRI-specific augmentation policies
+- a persistent autoresearch loop for architecture and hyperparameter exploration
 
-## Dataset: MRNet
+## What This Project Does
 
-The data comes from the Stanford ML Group research lab. It consists of 1,370 knee MRI exams performed at Stanford University Medical Center to study the presence of Anterior Cruciate Ligament (ACL) tears and Meniscus tears.
+The model predicts three labels from a full knee MRI exam:
 
-- **Input**: Multi-view MRI scans (Sagittal, Coronal, Axial).
-- **Task**: Multi-label, multi-class classification.
-- **Labels**: Abnormal, ACL tear, Meniscus tear.
+- `abnormal`
+- `acl`
+- `meniscus`
 
-You can request the dataset from [this link](https://stanfordmlgroup.github.io/competitions/mrnet/).
+Instead of training separate models per plane, the pipeline processes sagittal, coronal, and axial series together and fuses them into one exam-level prediction.
 
-## Setup
+## Architecture
 
-### Prerequisites
+The current best-performing family in this repo is a lightweight multi-plane model built on `mobilenet_v3_small` with GeM pooling and learned cross-plane fusion.
 
-- Python 3.11+
-- PyTorch compatible with your hardware, including MPS for Apple Silicon if available
+```mermaid
+flowchart TD
+    A["MRI Exam"] --> B["Sagittal Volume"]
+    A --> C["Coronal Volume"]
+    A --> D["Axial Volume"]
 
-### Installation
+    B --> E["Shared 2D Encoder"]
+    C --> E
+    D --> E
 
-```bash
-git clone https://github.com/your-repo/mrnet.git
-cd mrnet
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+    E --> F["Slice Pooling\n(max / mean / lse / attention / GeM)"]
+    F --> G["Per-Plane Embeddings"]
+    G --> H["Plane Fusion\n(concat / plane attention / plane transformer)"]
+    H --> I["Fusion MLP Head"]
+    I --> J["3-label Logits\nabnormal / acl / meniscus"]
 ```
 
-### Directory Structure
+### Training Pipeline
+
+```mermaid
+flowchart LR
+    A["MRMultiPlaneDataset"] --> B["Study-Consistent Augmentation"]
+    B --> C["Train.py"]
+    C --> D["Validation AUC / Loss"]
+    D --> E["Best Checkpoint"]
+    D --> F["Autoresearch Loop"]
+    F --> G["Next Config Proposal"]
+```
+
+## Repository Layout
 
 ```text
 .
-├── MRNet-v1.0/
-├── models/
-├── logs/
+├── README.md
+├── LICENSE
 ├── train.py
 ├── dataloader.py
-├── advanced_vit.py
 ├── lightweight_models.py
+├── pretrain_ssl.py
 ├── autoresearch_loop.py
-├── experiment_runner.py
-├── experiment_configs.py
-└── README.md
+├── research_controller.py
+├── research_priors.py
+├── export_ci_artifacts.py
+├── cleanup_runner_diag.py
+├── run_aug_research_sweep.sh
+├── run_gt95_campaign.sh
+├── run_gt95_architecture_locked.sh
+└── requirements.txt
 ```
 
-## Usage
+Generated data such as checkpoints, training logs, local datasets, and experiment outputs are intentionally excluded from Git.
 
-`train.py` is the canonical training entrypoint in this workspace.
+## Requirements
 
-### Basic Usage
+- Python 3.10+
+- PyTorch with MPS support if you are using Apple Silicon
+- Local access to the MRNet dataset
+
+## Dataset Setup
+
+Request the dataset from Stanford:
+
+- [MRNet dataset page](https://stanfordmlgroup.github.io/competitions/mrnet/)
+
+Expected layout:
+
+```text
+MRNet-v1.0/
+├── train-abnormal.csv
+├── train-acl.csv
+├── train-meniscus.csv
+├── valid-abnormal.csv
+├── valid-acl.csv
+├── valid-meniscus.csv
+├── train/
+│   ├── axial/
+│   ├── coronal/
+│   └── sagittal/
+└── valid/
+    ├── axial/
+    ├── coronal/
+    └── sagittal/
+```
+
+The dataset is ignored by Git and should remain local.
+
+## Installation
 
 ```bash
-python train.py --prefix_name my_experiment --model_type resnet18
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### Command-Line Arguments
+## Core Files
 
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| `--prefix_name` | Required experiment prefix used for logs and model names. | N/A |
-| `--task` | Task name used for logging. | `acl` |
-| `--plane` | Plane configuration label. | `Segittal_Coronal_and_Axial` |
-| `--epochs` | Number of training epochs. | `30` |
-| `--lr` | Learning rate. | `3e-4` |
-| `--patience` | Early stopping patience. | `8` |
-| `--save_model` | Save best checkpoint. | `1` |
-| `--flush_history` | Clear previous logs. | `0` |
-| `--log_every` | Logging interval in batches. | `25` |
-| `--data_root` | Path to dataset root. | `MRNet-v1.0` |
-| `--num_workers` | DataLoader workers. | `2` |
-| `--model_type` | Includes `resnet18`, `mobilenet_v3_small`, `efficientnet_b0`, `advanced`, and `multiscale`. | `resnet18` |
-| `--time_budget_minutes` | Optional wall-clock budget for experiment runs. | unset |
-| `--max_train_batches` | Optional cap for train batches. | unset |
-| `--max_val_batches` | Optional cap for validation batches. | unset |
+- `train.py`: main training entrypoint
+- `dataloader.py`: exam-level dataset and augmentation logic
+- `lightweight_models.py`: lightweight multi-plane architectures
+- `pretrain_ssl.py`: self-supervised slice-level pretraining
+- `autoresearch_loop.py`: persistent architecture / hyperparameter search
+- `research_controller.py`: proposes next experiments based on history and priors
 
-### Example
+## Training
 
-```bash
-python train.py --prefix_name r18_trial --model_type resnet18
-python train.py --prefix_name mobile_trial --model_type mobilenet_v3_small
-python train.py --prefix_name vit_trial --model_type advanced --vit_model vit_b_16
-```
-
-### Quick Smoke Test
+### Basic Example
 
 ```bash
 python train.py \
-  --prefix_name smoke_test \
-  --epochs 1 \
-  --pretrained 0 \
-  --save_model 0 \
-  --max_train_batches 2 \
-  --max_val_batches 2
+  --prefix_name baseline_mobile \
+  --model_type mobilenet_v3_small \
+  --pretrained 1
 ```
 
-## Faster Training Path
-
-The faster MRNet path is aimed at short automatic experiments and Apple Silicon:
-
-- A single exam-level dataset keeps sagittal, coronal, and axial scans synchronized.
-- `.npy` volumes are memory-mapped and optionally cached.
-- Resize and normalization happen in one batched operation on the device.
-- Lightweight pretrained backbones are available through `train.py`.
-
-Recommended first runs:
+### Strong Research-Fusion Style Example
 
 ```bash
-python train.py --prefix_name r18_trial --model_type resnet18
-python train.py --prefix_name mobile_trial --model_type mobilenet_v3_small
-python train.py --prefix_name effb0_trial --model_type efficientnet_b0
+python train.py \
+  --prefix_name research_fusion_trial \
+  --model_type mobilenet_v3_small \
+  --pretrained 1 \
+  --pooling gem \
+  --plane_fusion plane_attention \
+  --fusion_depth 3 \
+  --projection_dim 128 \
+  --hidden_dim 192 \
+  --dropout 0.15 \
+  --lr 0.00008 \
+  --weight_decay 0.0005 \
+  --aug_policy knee_mri_plus \
+  --loss_type focal \
+  --focal_gamma 1.5 \
+  --label_smoothing 0.03 \
+  --ema_decay 0.995
 ```
 
-New research-oriented options now available in `train.py`:
+### Useful Flags
 
-- `--plane_fusion plane_transformer` for stronger cross-plane token interaction
-- `--val_tta_mode flip` for validation-time flip ensembling
-- `--loss_type focal --label_smoothing ... --ema_decay ...` for better regularization on imbalanced data
-- `--aug_policy knee_mri_plus` for stronger MRI-safe augmentation
-- `--init_checkpoint <ssl_checkpoint>` for warm-starting from domain-specific self-supervised pretraining
+| Flag | Purpose |
+| --- | --- |
+| `--model_type` | Backbone family |
+| `--pretrained` | Toggle ImageNet initialization |
+| `--pooling` | Slice aggregation |
+| `--plane_fusion` | Cross-plane fusion strategy |
+| `--fusion_depth` | Depth of fusion MLP |
+| `--projection_dim` | Per-plane projection size |
+| `--hidden_dim` | Fusion hidden width |
+| `--aug_policy` | Augmentation recipe |
+| `--loss_type` | `bce` or `focal` |
+| `--ema_decay` | Exponential moving average for evaluation |
+| `--val_tta_mode` | Validation-time test-time augmentation |
 
-### Self-Supervised Pretraining
+## MRI-Specific Augmentation
 
-You can pretrain the encoder on unlabeled MRNet slices and then fine-tune it with `train.py`:
+The repo includes several augmentation modes:
+
+- `none`
+- `light`
+- `strong`
+- `knee_mri`
+- `knee_mri_plus`
+- `knee_mri_research`
+
+### `knee_mri_research`
+
+This is the newest MRI-focused policy. It was designed to keep anatomy plausible while improving robustness to scanner and acquisition variation.
+
+It adds:
+
+- study-consistent augmentation across all three planes
+- mild gamma and intensity jitter
+- controlled cutout and slice dropout
+- mild spatial shifts
+- bias-field intensity drift
+- blur / resolution perturbation
+- low-probability motion-style artifact simulation
+
+Associated knobs:
+
+- `--aug_bias_field_std`
+- `--aug_blur_sigma`
+- `--aug_motion_prob`
+- `--aug_noise_std`
+- `--aug_cutout_frac`
+- `--aug_slice_dropout`
+- `--aug_gamma_jitter`
+- `--aug_spatial_shift_frac`
+
+## Self-Supervised Pretraining
+
+You can pretrain the encoder on MRNet slices before supervised fine-tuning.
 
 ```bash
 python pretrain_ssl.py \
@@ -135,96 +223,78 @@ python pretrain_ssl.py \
   --model_type mobilenet_v3_small \
   --pretrained 1 \
   --data_root MRNet-v1.0
+```
 
+Then fine-tune:
+
+```bash
 python train.py \
   --prefix_name ssl_finetune_trial \
   --model_type mobilenet_v3_small \
+  --pretrained 1 \
+  --pooling gem \
   --plane_fusion plane_transformer \
-  --val_tta_mode flip \
   --aug_policy knee_mri_plus \
   --loss_type focal \
   --ema_decay 0.995 \
   --init_checkpoint ssl_pretrain_outputs/ssl_mobile_trial_best_ssl.pth
 ```
 
-## Autoresearch-Style Loop
+## Autoresearch Loop
 
-The main autoresearch path is now:
+The repo includes a persistent autoresearch loop that:
 
-```bash
-python3 autoresearch_loop.py --iterations 1 --data_root MRNet-v1.0
-```
+- tracks the current best configuration
+- proposes new experiments from priors and recent results
+- keeps only the best checkpoint
+- records result history and research memos
 
-This loop is persistent and architecture-improving:
-
-- it runs the baseline first on a fresh state directory
-- it then loads the current best config from `~/.mrnet_autoresearch`
-- after every experiment it writes a research memo, analyzes recent wins and failures, and proposes the next architecture
-- the built-in controller mixes result-history analysis with curated literature priors instead of blindly cycling the static prior table
-- you can optionally plug in an external research agent with `AUTORESEARCH_RESEARCH_AGENT_CMD` or `--research_agent_cmd`
-- each experiment starts from scratch instead of warm-starting from the previous best checkpoint
-- it runs a fixed-budget experiment with a fixed evaluation harness
-- uses validation AUC as the primary objective
-- uses simplicity only as a tie-breaker when AUC is effectively identical
-
-The best architecture is persisted in:
+Basic usage:
 
 ```bash
-~/.mrnet_autoresearch/best_config.json
+python autoresearch_loop.py \
+  --iterations 12 \
+  --data_root MRNet-v1.0
 ```
 
-The best checkpoint is persisted in:
+Artifacts are stored under a persistent state directory, including:
 
-```bash
-~/.mrnet_autoresearch/models/best_model.pth
-```
-
-Only this canonical best checkpoint is retained; candidate checkpoints are pruned after each iteration.
-
-The full run history is persisted in:
-
-```bash
-~/.mrnet_autoresearch/results.tsv
-```
-
-Per-candidate controller memos are also persisted in:
-
-```bash
-~/.mrnet_autoresearch/research_memos/<candidate>.json
-```
-
-`experiment_runner.py` still exists for fixed preset batches, but `autoresearch_loop.py` is the continuous-improvement path.
-
-Default per-candidate budget: `60` minutes, including scheduled workflow runs unless explicitly overridden.
+- `best_config.json`
+- `results.tsv`
+- `research_memos/`
+- `models/best_model.pth`
 
 ## GitHub Actions
 
-A GitHub Actions workflow is included at `.github/workflows/mrnet-autoresearch.yml`.
+The top-level repository includes a self-hosted GitHub Actions workflow for autoresearch.
 
-This is designed for a self-hosted Apple Silicon runner because:
+Recommended setup:
 
-- the MRNet dataset is local and not available on GitHub-hosted runners
-- Apple MPS is only available on your Mac, not on standard hosted runners
+1. Register an Apple Silicon self-hosted runner
+2. Set repository variable `MRNET_DATA_ROOT`
+3. Trigger the workflow manually or via schedule
 
-Suggested setup:
+The workflow is intended to upload lightweight experiment summaries and logs, not datasets or model weights.
 
-1. Register your Mac as a self-hosted Actions runner with labels `self-hosted`, `macOS`, and `ARM64`.
-2. Set the repository variable `MRNET_DATA_ROOT` to the local dataset path on that runner.
-3. Trigger the workflow manually from Actions, or use the built-in nightly schedule.
+## Reproducibility Notes
 
-The workflow uploads:
+- Validation AUC is the primary model-selection metric
+- Full-training results can differ from short-loop results
+- Aggressive augmentation and TTA do not automatically improve the best full-training result
+- The most reliable way to compare ideas is to keep architecture fixed and vary one factor at a time
 
-- `ci_results/summary.md`
-- `ci_results/results.tsv`
-- `ci_results/best_config.json`
-- `ci_results/logs/`
+## What Is Not Stored In Git
 
-and it reuses the same persistent state directory on the self-hosted runner so future scheduled runs continue from the latest best architecture instead of restarting.
+This repository is configured not to push:
 
-## Results
+- local datasets
+- model weights and checkpoints
+- generated training logs
+- full training output directories
+- runner/export artifacts
 
-The model is evaluated primarily with validation AUC. The compact shared-encoder path is intended to trade a small amount of peak accuracy for much faster iteration, which makes it a better fit for automatic experimentation on a Mac.
+See `.gitignore` for the enforced exclusions.
 
-## Contributions
+## License
 
-Contributions are welcome. If you have ideas for model improvements, data pipeline optimizations, or better experiment strategies, feel free to open a pull request.
+See `LICENSE`.

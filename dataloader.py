@@ -113,6 +113,9 @@ class MRVolumeAugmentor:
         slice_dropout=0.0,
         gamma_jitter=0.0,
         spatial_shift_frac=0.0,
+        bias_field_std=0.0,
+        blur_sigma=0.0,
+        motion_prob=0.0,
     ):
         self.policy = policy
         self.noise_std = max(float(noise_std), 0.0)
@@ -120,81 +123,148 @@ class MRVolumeAugmentor:
         self.slice_dropout = min(max(float(slice_dropout), 0.0), 0.5)
         self.gamma_jitter = min(max(float(gamma_jitter), 0.0), 0.5)
         self.spatial_shift_frac = min(max(float(spatial_shift_frac), 0.0), 0.2)
+        self.bias_field_std = min(max(float(bias_field_std), 0.0), 0.5)
+        self.blur_sigma = min(max(float(blur_sigma), 0.0), 2.0)
+        self.motion_prob = min(max(float(motion_prob), 0.0), 1.0)
 
-    def __call__(self, volume):
+    def sample_plan(self, volume):
+        if self.policy == "none":
+            return {"policy": "none"}
+
+        plan = {
+            "policy": self.policy,
+            "flip": False,
+            "intensity_scale": 1.0,
+            "intensity_bias": 0.0,
+            "noise_std": 0.0,
+            "cutout": None,
+            "slice_positions": None,
+            "gamma": None,
+            "shift": (0, 0),
+            "bias_field": None,
+            "blur_kernel": None,
+            "motion_axis": None,
+            "motion_shift": 0,
+        }
+
+        if self.policy in {"light", "strong", "knee_mri", "knee_mri_plus", "knee_mri_research"}:
+            plan["flip"] = random.random() < 0.5
+            plan["intensity_scale"] = 1.0 + random.uniform(-0.08, 0.08)
+            plan["intensity_bias"] = random.uniform(-0.08, 0.08)
+
+        if self.policy in {"strong", "knee_mri", "knee_mri_plus", "knee_mri_research"}:
+            if self.noise_std > 0:
+                plan["noise_std"] = self.noise_std
+
+            if self.cutout_frac > 0 and random.random() < 0.5:
+                _, height, width = volume.shape
+                cut_h = max(1, int(height * self.cutout_frac))
+                cut_w = max(1, int(width * self.cutout_frac))
+                top = random.randint(0, max(0, height - cut_h))
+                left = random.randint(0, max(0, width - cut_w))
+                plan["cutout"] = (top, left, cut_h, cut_w)
+
+            if self.slice_dropout > 0 and volume.shape[0] > 4:
+                slice_positions = [
+                    (idx + 0.5) / float(volume.shape[0])
+                    for idx in range(volume.shape[0])
+                    if random.random() < self.slice_dropout
+                ]
+                if len(slice_positions) >= volume.shape[0]:
+                    slice_positions = slice_positions[:-1]
+                if slice_positions:
+                    plan["slice_positions"] = slice_positions
+
+        if self.policy in {"knee_mri_plus", "knee_mri_research"}:
+            if self.gamma_jitter > 0 and random.random() < 0.5:
+                plan["gamma"] = 1.0 + random.uniform(-self.gamma_jitter, self.gamma_jitter)
+
+            if self.spatial_shift_frac > 0 and random.random() < 0.5:
+                _, height, width = volume.shape
+                max_dy = max(1, int(height * self.spatial_shift_frac))
+                max_dx = max(1, int(width * self.spatial_shift_frac))
+                plan["shift"] = (
+                    random.randint(-max_dy, max_dy),
+                    random.randint(-max_dx, max_dx),
+                )
+
+        if self.policy == "knee_mri_research":
+            if self.bias_field_std > 0 and random.random() < 0.6:
+                plan["bias_field"] = self._sample_bias_field(volume.shape[1], volume.shape[2])
+            if self.blur_sigma > 0 and random.random() < 0.35:
+                plan["blur_kernel"] = self._sample_blur_kernel()
+            if self.motion_prob > 0 and random.random() < self.motion_prob:
+                plan["motion_axis"] = random.choice([1, 2])
+                plan["motion_shift"] = random.choice([-2, -1, 1, 2])
+
+        return plan
+
+    def __call__(self, volume, plan=None):
         if self.policy == "none":
             return volume
 
+        if plan is None:
+            plan = self.sample_plan(volume)
+
         augmented = volume.clone()
-        if self.policy in {"light", "strong", "knee_mri", "knee_mri_plus"}:
-            augmented = self._random_flip(augmented)
-            augmented = self._random_intensity_shift(augmented)
+        if plan.get("flip"):
+            augmented = torch.flip(augmented, dims=[2])
 
-        if self.policy in {"strong", "knee_mri", "knee_mri_plus"}:
-            augmented = self._random_noise(augmented)
-            augmented = self._random_cutout(augmented)
-            augmented = self._random_slice_dropout(augmented)
+        augmented = augmented * plan.get("intensity_scale", 1.0) + plan.get("intensity_bias", 0.0)
 
-        if self.policy == "knee_mri_plus":
-            augmented = self._random_gamma(augmented)
-            augmented = self._random_spatial_shift(augmented)
+        noise_std = plan.get("noise_std", 0.0)
+        if noise_std > 0:
+            augmented = augmented + torch.randn_like(augmented) * noise_std
+
+        cutout = plan.get("cutout")
+        if cutout is not None:
+            top, left, cut_h, cut_w = cutout
+            augmented[:, top:top + cut_h, left:left + cut_w] = 0
+
+        slice_positions = plan.get("slice_positions")
+        if slice_positions:
+            slice_indexes = sorted(
+                {
+                    min(volume.shape[0] - 1, max(0, int(position * volume.shape[0])))
+                    for position in slice_positions
+                }
+            )
+            if len(slice_indexes) >= volume.shape[0]:
+                slice_indexes = slice_indexes[:-1]
+            if slice_indexes:
+                augmented[slice_indexes] = 0
+
+        gamma = plan.get("gamma")
+        if gamma is not None:
+            augmented = self._apply_gamma(augmented, gamma)
+
+        shift = plan.get("shift", (0, 0))
+        if shift != (0, 0):
+            augmented = self._apply_spatial_shift(augmented, shift)
+
+        bias_field = plan.get("bias_field")
+        if bias_field is not None:
+            augmented = augmented * bias_field.unsqueeze(0)
+
+        blur_kernel = plan.get("blur_kernel")
+        if blur_kernel is not None:
+            augmented = self._apply_blur(augmented, blur_kernel)
+
+        motion_axis = plan.get("motion_axis")
+        if motion_axis is not None:
+            augmented = self._apply_motion_artifact(augmented, motion_axis, plan.get("motion_shift", 0))
 
         return augmented
 
-    def _random_flip(self, volume):
-        if random.random() < 0.5:
-            return torch.flip(volume, dims=[2])
-        return volume
-
-    def _random_intensity_shift(self, volume):
-        scale = 1.0 + random.uniform(-0.08, 0.08)
-        bias = random.uniform(-0.08, 0.08)
-        return volume * scale + bias
-
-    def _random_noise(self, volume):
-        if self.noise_std <= 0:
-            return volume
-        noise = torch.randn_like(volume) * self.noise_std
-        return volume + noise
-
-    def _random_cutout(self, volume):
-        if self.cutout_frac <= 0 or random.random() >= 0.5:
-            return volume
-        _, height, width = volume.shape
-        cut_h = max(1, int(height * self.cutout_frac))
-        cut_w = max(1, int(width * self.cutout_frac))
-        top = random.randint(0, max(0, height - cut_h))
-        left = random.randint(0, max(0, width - cut_w))
-        volume[:, top:top + cut_h, left:left + cut_w] = 0
-        return volume
-
-    def _random_slice_dropout(self, volume):
-        if self.slice_dropout <= 0 or volume.shape[0] <= 4:
-            return volume
-        mask = torch.rand(volume.shape[0]) < self.slice_dropout
-        if mask.all():
-            mask[random.randrange(volume.shape[0])] = False
-        volume[mask] = 0
-        return volume
-
-    def _random_gamma(self, volume):
-        if self.gamma_jitter <= 0 or random.random() >= 0.5:
-            return volume
-        gamma = 1.0 + random.uniform(-self.gamma_jitter, self.gamma_jitter)
+    def _apply_gamma(self, volume, gamma):
         lower = torch.quantile(volume, 0.01)
         upper = torch.quantile(volume, 0.99)
         scaled = torch.clamp((volume - lower) / (upper - lower + 1e-6), 0.0, 1.0)
         adjusted = scaled.pow(gamma) * (upper - lower) + lower
         return adjusted
 
-    def _random_spatial_shift(self, volume):
-        if self.spatial_shift_frac <= 0 or random.random() >= 0.5:
-            return volume
-        _, height, width = volume.shape
-        max_dy = max(1, int(height * self.spatial_shift_frac))
-        max_dx = max(1, int(width * self.spatial_shift_frac))
-        dy = random.randint(-max_dy, max_dy)
-        dx = random.randint(-max_dx, max_dx)
+    def _apply_spatial_shift(self, volume, shift):
+        dy, dx = shift
         shifted = torch.roll(volume, shifts=(dy, dx), dims=(1, 2))
         if dy > 0:
             shifted[:, :dy, :] = 0
@@ -205,6 +275,42 @@ class MRVolumeAugmentor:
         elif dx < 0:
             shifted[:, :, dx:] = 0
         return shifted
+
+    def _sample_bias_field(self, height, width):
+        yy = torch.linspace(-1.0, 1.0, height, dtype=torch.float32)
+        xx = torch.linspace(-1.0, 1.0, width, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
+        a = random.uniform(-self.bias_field_std, self.bias_field_std)
+        b = random.uniform(-self.bias_field_std, self.bias_field_std)
+        c = random.uniform(-self.bias_field_std * 0.5, self.bias_field_std * 0.5)
+        field = 1.0 + a * grid_x + b * grid_y + c * grid_x * grid_y
+        return torch.clamp(field, min=0.7, max=1.3)
+
+    def _sample_blur_kernel(self):
+        sigma = random.uniform(max(self.blur_sigma * 0.5, 1e-3), self.blur_sigma)
+        radius = max(1, int(round(sigma * 2)))
+        coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
+        kernel = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        kernel = kernel / kernel.sum()
+        return kernel
+
+    def _apply_blur(self, volume, kernel):
+        pad = kernel.numel() // 2
+        device = volume.device
+        dtype = volume.dtype
+        kernel = kernel.to(device=device, dtype=dtype)
+        kernel_x = kernel.view(1, 1, 1, -1)
+        kernel_y = kernel.view(1, 1, -1, 1)
+        image = volume.unsqueeze(1)
+        image = torch.nn.functional.pad(image, (pad, pad, 0, 0), mode="reflect")
+        image = torch.nn.functional.conv2d(image, kernel_x.expand(1, 1, 1, kernel.numel()), groups=1)
+        image = torch.nn.functional.pad(image, (0, 0, pad, pad), mode="reflect")
+        image = torch.nn.functional.conv2d(image, kernel_y.expand(1, 1, kernel.numel(), 1), groups=1)
+        return image.squeeze(1)
+
+    def _apply_motion_artifact(self, volume, axis, shift):
+        shifted = torch.roll(volume, shifts=shift, dims=axis)
+        return 0.7 * volume + 0.3 * shifted
 
 
 def _compute_class_weights(labels):
@@ -263,6 +369,10 @@ class MRMultiPlaneDataset(data.Dataset):
     def __getitem__(self, index):
         volumes = tuple(self._load_volume(plane, index) for plane in self.planes)
         if self.transform is not None:
-            volumes = tuple(self.transform(volume) for volume in volumes)
+            if hasattr(self.transform, "sample_plan"):
+                plan = self.transform.sample_plan(volumes[0])
+                volumes = tuple(self.transform(volume, plan=plan) for volume in volumes)
+            else:
+                volumes = tuple(self.transform(volume) for volume in volumes)
         label = torch.from_numpy(self.labels[index])
         return volumes, label, self.weights, self.exam_ids[index]
