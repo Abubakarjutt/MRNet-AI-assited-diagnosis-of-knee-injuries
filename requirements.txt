@@ -4,3 +4,7 @@ tensorboardX
 scikit-learn
 pandas
 geomloss
+transformers>=4.56
+huggingface_hub>=0.26
+pillow
+pytest
