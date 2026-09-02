@@ -32,7 +32,20 @@ def test_medsiglip_run_end_to_end(mrnet_fixture, stub_medsiglip, monkeypatch, tm
     ]
     monkeypatch.setattr("sys.argv", argv)
     args = train.parse_arguments()
+
+    calls = {"n": 0}
+    real_prepare = train.prepare_inputs
+    def _counting_prepare(*a, **k):
+        calls["n"] += 1
+        return real_prepare(*a, **k)
+    monkeypatch.setattr(train, "prepare_inputs", _counting_prepare)
+
     train.run(args)
+
+    # 2 train batches + 2 val batches, each preparing inputs exactly once.
+    # The old double-prepare bug (unconditional call at the top of the val loop)
+    # would make this 6.
+    assert calls["n"] == 4, calls["n"]
 
     checkpoints = glob.glob(os.path.join("models", "*medsiglip_smoke*.pth"))
     assert checkpoints, "run() wrote no checkpoint"

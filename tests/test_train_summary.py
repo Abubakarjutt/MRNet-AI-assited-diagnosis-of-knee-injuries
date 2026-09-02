@@ -75,4 +75,5 @@ def test_build_optimizer_only_sees_trainable_params(stub_medsiglip):
 
     in_optimizer = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    assert in_optimizer == trainable
+    total = sum(p.numel() for p in model.parameters())
+    assert 0 < in_optimizer == trainable < total

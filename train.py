@@ -299,6 +299,11 @@ def iterate_epoch(
 def apply_backbone_freezing(model, args):
     encoder = getattr(model, "encoder", None)
     if encoder is None:
+        if getattr(args, "freeze_backbone", "auto") == "1":
+            print(
+                f"[freeze_backbone=1] ignored: model_type={getattr(args, 'model_type', '?')} "
+                "has no .encoder to freeze."
+            )
         return
 
     mode = getattr(args, "freeze_backbone", "auto")
@@ -440,12 +445,17 @@ def maybe_load_init_checkpoint(model, checkpoint_path):
         return
 
     load_result = model.load_state_dict(compatible, strict=False)
-    print(
+    real_missing = [key for key in load_result.missing_keys if key in model_state]
+    excluded_missing = len(load_result.missing_keys) - len(real_missing)
+    message = (
         f"Warm-started from {checkpoint_path} with {len(compatible)} tensors; "
-        f"missing={len(load_result.missing_keys)} "
+        f"missing={len(real_missing)} "
         f"unexpected={len(load_result.unexpected_keys)} "
         f"shape_mismatch={len(skipped_shape)}"
     )
+    if excluded_missing:
+        message += f" (+{excluded_missing} intentionally-excluded frozen keys)"
+    print(message)
 
 
 def run(args):
@@ -720,7 +730,7 @@ def parse_arguments():
         type=int,
         choices=[0, 1],
         default=1,
-        help="Use ImageNet pretrained weights.",
+        help="Use ImageNet pretrained weights (ignored for --model_type medsiglip: its tower is always pretrained MedSigLIP).",
     )
     parser.add_argument(
         "--data_root",

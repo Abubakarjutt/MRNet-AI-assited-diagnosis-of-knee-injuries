@@ -78,7 +78,11 @@ def test_fastmrnet_medsiglip_checkpoint_excludes_tower(stub_medsiglip, tmp_path)
     torch.save(state, path)
     reloaded = torch.load(path, weights_only=True)
     result = model.load_state_dict(reloaded, strict=False)
-    assert all("encoder.tower" not in key for key in result.unexpected_keys)
+    # the frozen tower is absent from the saved state, so load_state_dict reports
+    # its keys as missing -- and ONLY its keys.
+    assert result.missing_keys, "expected the excluded tower keys to show as missing"
+    assert all(k.startswith("encoder.tower") for k in result.missing_keys)
+    assert not result.unexpected_keys
 
 
 class _NoVisionModel(nn.Module):
@@ -159,7 +163,10 @@ def test_encoder_actually_micro_batches(stub_medsiglip):
         return real_forward(*args, **kwargs)
 
     encoder.tower.forward = counting_forward
-    out = encoder(torch.randn(10, 3, 448, 448))
+    try:
+        out = encoder(torch.randn(10, 3, 448, 448))
+    finally:
+        encoder.tower.forward = real_forward
 
     assert out.shape == (10, 1152)
     assert len(calls) == math.ceil(10 / 4)      # 3 micro-batches, not 1

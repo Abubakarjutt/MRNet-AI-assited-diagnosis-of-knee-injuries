@@ -28,12 +28,19 @@ class MedSigLIPEncoder(nn.Module):
         # so it never enters state_dict()/parameters(). Used only as the
         # pooler_output fallback in forward().
         self._image_features_fallback = getattr(full, "get_image_features", None)
-        self.feature_dim = 1152
         self.chunk_size = int(chunk_size)
 
         for parameter in self.tower.parameters():
             parameter.requires_grad_(False)
         self.tower.eval()
+
+        config = getattr(self.tower, "config", None)
+        hidden = getattr(config, "hidden_size", None)
+        if hidden is not None and hidden != 1152:
+            raise ValueError(
+                f"MedSigLIPEncoder expects a 1152-dim SigLIP tower; got hidden_size={hidden}."
+            )
+        self.feature_dim = hidden or 1152
 
     def train(self, mode=True):
         super().train(mode)
@@ -43,9 +50,10 @@ class MedSigLIPEncoder(nn.Module):
     @torch.no_grad()
     def forward(self, flat_inputs):
         flat_inputs = flat_inputs.to(dtype=torch.float32)
+        step = self.chunk_size if self.chunk_size > 0 else flat_inputs.shape[0]
         pooled_chunks = []
-        for start in range(0, flat_inputs.shape[0], self.chunk_size):
-            chunk = flat_inputs[start:start + self.chunk_size]
+        for start in range(0, flat_inputs.shape[0], step):
+            chunk = flat_inputs[start:start + step]
             output = self.tower(pixel_values=chunk)
             pooled = getattr(output, "pooler_output", None)
             if pooled is None:
@@ -65,6 +73,3 @@ class MedSigLIPEncoder(nn.Module):
         if destination is None:
             destination = OrderedDict()
         return destination
-
-    def _load_from_state_dict(self, *args, **kwargs):
-        return

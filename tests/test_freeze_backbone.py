@@ -29,7 +29,7 @@ def _args(**overrides):
 def test_auto_leaves_cnn_backbone_trainable():
     model = FastMRNet(backbone_name="mobilenet_v3_small", num_classes=3, pretrained=False)
     train.apply_backbone_freezing(model, _args(model_type="mobilenet_v3_small"))
-    assert any(p.requires_grad for p in model.encoder.parameters())
+    assert all(p.requires_grad for p in model.encoder.parameters())
 
 
 def test_auto_freezes_medsiglip_encoder(stub_medsiglip):
@@ -54,6 +54,16 @@ def test_explicit_zero_on_medsiglip_warns_and_stays_frozen(stub_medsiglip, capsy
 def test_build_model_sets_chunk_size(stub_medsiglip):
     model = train.build_model(_args(model_type="medsiglip", medsiglip_chunk=8))
     assert model.encoder.chunk_size == 8
+
+
+def test_freeze_one_warns_when_no_encoder(capsys):
+    from types import SimpleNamespace
+    class _NoEncoder:
+        pass
+    train.apply_backbone_freezing(
+        _NoEncoder(), SimpleNamespace(model_type="multiscale", freeze_backbone="1")
+    )
+    assert "has no .encoder to freeze" in capsys.readouterr().out
 
 
 def test_argparser_accepts_medsiglip(monkeypatch):

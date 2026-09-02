@@ -133,6 +133,7 @@ MODEL_COMPLEXITY = {
     "mobilenet_v3_small": 0.0,
     "resnet18": 0.2,
     "efficientnet_b0": 0.4,
+    "medsiglip": 0.6,
 }
 
 POOLING_COMPLEXITY = {

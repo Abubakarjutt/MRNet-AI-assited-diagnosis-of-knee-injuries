@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import train
 import utils
-import utils as utils_module
 
 
 def test_siglip_constants_shape_and_value():
@@ -76,8 +75,8 @@ def test_resolve_input_spec_medsiglip():
     assert spec["image_size"] == 448
     assert spec["interp_mode"] == "bicubic"
     assert spec["antialias"] is True
-    assert spec["mean"] is utils_module.SIGLIP_MEAN
-    assert spec["std"] is utils_module.SIGLIP_STD
+    assert spec["mean"] is utils.SIGLIP_MEAN
+    assert spec["std"] is utils.SIGLIP_STD
 
 
 def test_resolve_input_spec_default_backbone():
@@ -86,8 +85,8 @@ def test_resolve_input_spec_default_backbone():
     assert spec["image_size"] == 224
     assert spec["interp_mode"] == "bilinear"
     assert spec["antialias"] is False
-    assert spec["mean"] is utils_module.IMAGENET_MEAN
-    assert spec["std"] is utils_module.IMAGENET_STD
+    assert spec["mean"] is utils.IMAGENET_MEAN
+    assert spec["std"] is utils.IMAGENET_STD
 
 
 def test_prepare_inputs_uses_medsiglip_spec(mrnet_fixture):
