@@ -304,6 +304,50 @@ def apply_backbone_freezing(model, args):
         )
 
 
+def build_optimizer(model, args):
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    return optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+
+
+def param_counts(model):
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    return total / 1e6, trainable / 1e6
+
+
+def model_complexity_score(args):
+    model_complexity = {
+        "mobilenet_v3_small": 0.0,
+        "resnet18": 0.2,
+        "efficientnet_b0": 0.4,
+        "medsiglip": 0.6,
+    }.get(args.model_type, 0.0)
+    pooling_complexity = {
+        "max": 0.0, "mean": 0.0, "lse": 0.2, "gem": 0.3, "attention": 0.5
+    }.get(args.pooling, 0.3)
+    augmentation_complexity = {
+        "none": 0.0, "light": 0.05, "strong": 0.12,
+        "knee_mri": 0.18, "knee_mri_plus": 0.24, "knee_mri_research": 0.30,
+    }.get(args.aug_policy, 0.08)
+    fusion_complexity = 0.2 * max(int(args.fusion_depth) - 1, 0)
+    gate_complexity = 0.15 * (1 if args.fusion_gate == "se" else 0)
+    plane_fusion_complexity = {
+        "concat": 0.0, "plane_attention": 0.12, "plane_transformer": 0.22
+    }.get(args.plane_fusion, 0.0)
+    tta_complexity = 0.05 if args.val_tta_mode != "none" else 0.0
+    return (
+        model_complexity
+        + pooling_complexity
+        + fusion_complexity
+        + gate_complexity
+        + augmentation_complexity
+        + plane_fusion_complexity
+        + tta_complexity
+    )
+
+
 def build_model(args):
     if args.model_type == "advanced":
         model = advanced_vit.AdvancedMRNetViT(
@@ -440,11 +484,10 @@ def run(args):
     model.to(device)
 
      # Log model architecture info for tracking
-    num_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: {args.model_type}, Parameters: {num_params/1e6:.2f}M, Trainable: {trainable_params/1e6:.2f}M")
+    num_params_m, trainable_params_m = param_counts(model)
+    print(f"Model: {args.model_type}, Parameters: {num_params_m:.2f}M, Trainable: {trainable_params_m:.2f}M")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         patience=3,
@@ -557,40 +600,11 @@ def run(args):
     training_seconds = time.time() - t_start_training
     writer.close()
 
-    num_params = sum(parameter.numel() for parameter in model.parameters())
+    num_params_m, trainable_params_m = param_counts(model)
     avg_epoch_time = float(np.mean(avg_epoch_seconds)) if avg_epoch_seconds else float("nan")
 
      # Compute model complexity score for autoresearch tracking
-    model_complexity = 0.0
-    if args.model_type == "mobilenet_v3_small":
-        model_complexity = 0.0
-    elif args.model_type == "resnet18":
-        model_complexity = 0.2
-    elif args.model_type == "efficientnet_b0":
-        model_complexity = 0.4
-
-    pooling_complexity = {"max": 0.0, "mean": 0.0, "lse": 0.2, "gem": 0.3, "attention": 0.5}.get(args.pooling, 0.3)
-    augmentation_complexity = {
-        "none": 0.0,
-        "light": 0.05,
-        "strong": 0.12,
-        "knee_mri": 0.18,
-        "knee_mri_plus": 0.24,
-        "knee_mri_research": 0.30,
-    }.get(args.aug_policy, 0.08)
-    fusion_complexity = 0.2 * max(int(args.fusion_depth) - 1, 0)
-    gate_complexity = 0.15 * (1 if args.fusion_gate == "se" else 0)
-    plane_fusion_complexity = {"concat": 0.0, "plane_attention": 0.12, "plane_transformer": 0.22}.get(args.plane_fusion, 0.0)
-    tta_complexity = 0.05 if args.val_tta_mode != "none" else 0.0
-    total_complexity = (
-        model_complexity
-        + pooling_complexity
-        + fusion_complexity
-        + gate_complexity
-        + augmentation_complexity
-        + plane_fusion_complexity
-        + tta_complexity
-    )
+    total_complexity = model_complexity_score(args)
 
     print("---")
     print(f"best_val_auc:       {best_val_auc:.6f}")
@@ -599,7 +613,8 @@ def run(args):
     print(f"avg_epoch_seconds:  {avg_epoch_time:.2f}")
     print(f"epochs_ran:         {len(avg_epoch_seconds)}")
     print(f"best_epoch:         {best_epoch}")
-    print(f"num_params_M:       {num_params / 1e6:.2f}")
+    print(f"num_params_M:       {num_params_m:.2f}")
+    print(f"trainable_params_M: {trainable_params_m:.2f}")
     print(f"model_type:         {args.model_type}")
     print(f"model_complexity:   {total_complexity:.2f}")
     print(f"device:             {device.type}")
