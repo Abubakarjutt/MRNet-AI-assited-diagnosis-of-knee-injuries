@@ -286,6 +286,24 @@ def iterate_epoch(
     return epoch_loss, epoch_auc, y_trues, y_preds, global_step
 
 
+def apply_backbone_freezing(model, args):
+    encoder = getattr(model, "encoder", None)
+    if encoder is None:
+        return
+
+    mode = getattr(args, "freeze_backbone", "auto")
+    is_medsiglip = getattr(args, "model_type", "") == "medsiglip"
+
+    if mode == "1" or (mode == "auto" and is_medsiglip):
+        for parameter in encoder.parameters():
+            parameter.requires_grad_(False)
+    elif mode == "0" and is_medsiglip:
+        print(
+            "[freeze_backbone=0] ignored for medsiglip: the MedSigLIP tower is "
+            "frozen by construction."
+        )
+
+
 def build_model(args):
     if args.model_type == "advanced":
         model = advanced_vit.AdvancedMRNetViT(
@@ -313,6 +331,10 @@ def build_model(args):
             plane_fusion=args.plane_fusion,
             plane_transformer_heads=args.plane_transformer_heads,
         )
+
+    apply_backbone_freezing(model, args)
+    if args.model_type == "medsiglip":
+        model.encoder.chunk_size = args.medsiglip_chunk
 
     return model
 
@@ -644,6 +666,7 @@ def parse_arguments():
             "resnet18",
             "mobilenet_v3_small",
             "efficientnet_b0",
+            "medsiglip",
         ],
         help="Model family to use. Lighter CNNs are much faster than the ViT variants.",
     )
@@ -653,6 +676,19 @@ def parse_arguments():
         default="vit_b_16",
         choices=["vit_b_16", "vit_l_16", "vit_h_14"],
         help="Only used when model_type=advanced.",
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        type=str,
+        choices=["auto", "0", "1"],
+        default="auto",
+        help="auto = freeze only the medsiglip encoder; 1/0 force freeze/trainable for any backbone.",
+    )
+    parser.add_argument(
+        "--medsiglip_chunk",
+        type=int,
+        default=32,
+        help="Slice micro-batch size inside the frozen MedSigLIP encoder (MPS memory bound).",
     )
     parser.add_argument(
         "--pretrained",
