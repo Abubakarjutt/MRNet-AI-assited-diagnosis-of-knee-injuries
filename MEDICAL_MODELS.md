@@ -42,6 +42,12 @@ python train.py \
 - The frozen tower is excluded from saved `.pth` checkpoints; it always reloads from the
   HF cache. `num_params_M` in the run summary includes it (~430M); `trainable_params_M`
   is the real trainable size (~1–5M).
+- `MedSigLIPEncoder` loads the full `google/medsiglip-448` with `AutoModel` and holds a
+  reference to it so `get_image_features` stays available as a fallback (used only if a
+  future `transformers` release stops returning `pooler_output` from the vision tower).
+  That keeps the unused ~1.8 GB text tower resident for the whole run. It is inert for
+  the current model — which always returns `pooler_output` — but it counts against the
+  ≥32 GB unified-memory requirement.
 - Encoding ~75–120 slices per exam through a 400M ViT on MPS is slow (minutes/epoch).
   Use `--max_train_batches` / `--time_budget_minutes` for short loops.
 - Resize is bicubic + antialias to approximate the SigLIP processor; it is not a
