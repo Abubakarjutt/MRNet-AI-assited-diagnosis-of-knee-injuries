@@ -255,7 +255,16 @@ def score_exam(model, processor, images):
         return_tensors="pt",
         do_pan_and_scan=False,
     )
-    batch = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+    model_dtype = getattr(model, "dtype", None)
+
+    def _to_model(value):
+        if not torch.is_tensor(value):
+            return value
+        if model_dtype is not None and value.is_floating_point():
+            return value.to(device=model.device, dtype=model_dtype)
+        return value.to(device=model.device)
+
+    batch = {k: _to_model(v) for k, v in batch.items()}
 
     input_ids = batch["input_ids"]
     slots = locate_answer_slots(processor, input_ids[0])

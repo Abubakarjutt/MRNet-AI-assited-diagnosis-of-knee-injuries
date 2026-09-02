@@ -15,23 +15,31 @@ import vlm_finetune
 
 
 # --- The language-only target regex ----------------------------------------- #
-def test_lora_regex_matches_language_q_proj():
-    name = "language_model.model.layers.0.self_attn.q_proj"
-    assert re.search(vlm_finetune.LORA_TARGET_MODULES, name)
+# PEFT matches target_modules with re.fullmatch, so these tests use fullmatch too
+# (re.search masked C2: it matched regardless of the leading `model.` wrapper).
+_PAT = vlm_finetune.LORA_TARGET_MODULES
 
 
-@pytest.mark.parametrize("proj", ["k_proj", "v_proj", "o_proj",
-                                   "gate_proj", "up_proj", "down_proj"])
-def test_lora_regex_matches_each_proj(proj):
-    name = f"language_model.model.layers.3.mlp.{proj}"
-    assert re.search(vlm_finetune.LORA_TARGET_MODULES, name)
+@pytest.mark.parametrize("name", [
+    "model.language_model.layers.0.self_attn.q_proj",       # real Gemma-3 layout
+    "language_model.model.layers.0.self_attn.q_proj",       # older/no-wrapper layout
+])
+@pytest.mark.parametrize("proj", ["q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj"])
+def test_lora_regex_fullmatches_language_proj(name, proj):
+    name = name.rsplit(".", 1)[0] + "." + proj
+    assert re.fullmatch(_PAT, name) is not None
 
 
-@pytest.mark.parametrize("subsystem", ["vision_tower", "multi_modal_projector"])
-def test_lora_regex_rejects_vision_and_projector(subsystem):
-    # Anchored on language_model. so these must NOT match (spec section 5.4 / 9.3).
-    name = f"{subsystem}.blocks.0.attn.q_proj"
-    assert re.search(vlm_finetune.LORA_TARGET_MODULES, name) is None
+@pytest.mark.parametrize("name", [
+    "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj",
+    "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj",
+    "model.multi_modal_projector.mm_input_projection_weight",
+    "model.language_model.norm",                            # not a proj
+    "model.language_model.layers.0.self_attn.q_proj.weight",  # param, not module name
+])
+def test_lora_regex_rejects_non_targets(name):
+    assert re.fullmatch(_PAT, name) is None
 
 
 # --- assert_freeze: the no-leak guarantee ------------------------------------ #

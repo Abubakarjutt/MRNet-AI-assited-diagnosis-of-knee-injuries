@@ -41,9 +41,13 @@ def maybe_sync(device):
         torch.mps.synchronize()
 
 
-# LoRA targets the language model only; the regex is anchored on language_model. so the
-# SigLIP vision tower and the multi_modal_projector are NOT matched.
-LORA_TARGET_MODULES = r"language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+# Anchored on `language_model.` but tolerant of the `model.` wrapper that
+# Gemma3ForConditionalGeneration adds (real names: model.language_model.layers.N...).
+# PEFT uses re.fullmatch, so the leading `(?:.*\.)?` is load-bearing. Still leak-proof:
+# the SigLIP tower and multi_modal_projector have no `language_model.` segment.
+LORA_TARGET_MODULES = (
+    r"(?:.*\.)?language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+)
 _VISION_FROZEN_SUBSTRINGS = ("vision_tower", "multi_modal_projector")
 _TRAINABLE_TRIPWIRE_M = 60.0        # LoRA leak guard (spec section 9.3)
 
@@ -164,6 +168,25 @@ def evaluate(model, processor, val_loader, device, max_val_batches=None,
     return float(pooled_auc), per_task, None, y_pred, y_true
 
 
+def _batch_to_model(batch, model):
+    """Move collated tensors onto the model's device and cast floating tensors
+    (pixel_values) to its compute dtype. Int tensors (input_ids/attention_mask/labels)
+    and non-tensor entries (label/exam_id/images) pass through untouched."""
+    device = getattr(model, "device", None)
+    if device is None:
+        device = next(model.parameters()).device
+    dtype = getattr(model, "dtype", None)
+    moved = {}
+    for key, value in batch.items():
+        if not torch.is_tensor(value):
+            moved[key] = value
+        elif dtype is not None and value.is_floating_point():
+            moved[key] = value.to(device=device, dtype=dtype)
+        else:
+            moved[key] = value.to(device=device)
+    return moved
+
+
 def train_one_epoch(model, optimizer, scheduler, train_loader, device, args,
                     global_step, start_time):
     """One epoch. Optimizer steps every grad_accum samples; honors batch + time budgets."""
@@ -179,27 +202,28 @@ def train_one_epoch(model, optimizer, scheduler, train_loader, device, args,
             print(f"Stopping training early after reaching the "
                   f"{args.time_budget_minutes:.2f} minute budget.")
             break
+        batch = _batch_to_model(batch, model)
         loss = model(**batch).loss / float(args.grad_accum)
         loss.backward()
         running_loss += loss.item()
         n_seen += 1
         accumulator += 1
         if accumulator >= args.grad_accum:
-            optimizer.zero_grad(set_to_none=True)
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0
             )
             optimizer.step()
             scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
             accumulator = 0
             global_step += 1
     if accumulator > 0:
-        optimizer.zero_grad(set_to_none=True)
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], max_norm=1.0
         )
         optimizer.step()
         scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
         global_step += 1
     return running_loss / max(n_seen, 1), global_step
 
@@ -249,14 +273,11 @@ def run(args):
     torch.manual_seed(args.seed)
     device = utils.get_device()
 
-    processor, model, trainable_M = build_model(args, device)
-    processor_ref["processor"] = processor
-    full_M = sum(p.numel() for p in model.parameters()) / 1e6
-    train_loader, val_loader = build_loaders(args)
-
     if args.eval_only is not None:
         processor, model, trainable_M = _rebuild_with_adapter(args, device)
+        processor_ref["processor"] = processor          # BEFORE build_loaders
         full_M = sum(p.numel() for p in model.parameters()) / 1e6
+        _, val_loader = build_loaders(args)
         pooled_auc, per_task, val_ce, _, _ = evaluate(
             model, processor, val_loader, device,
             max_val_batches=args.max_val_batches,
@@ -267,6 +288,11 @@ def run(args):
                        (val_ce if val_ce is not None else float("nan")),
                        per_task, 0.0, 0, -1, full_M, trainable_M)
         return float(pooled_auc)
+
+    processor, model, trainable_M = build_model(args, device)
+    processor_ref["processor"] = processor
+    full_M = sum(p.numel() for p in model.parameters()) / 1e6
+    train_loader, val_loader = build_loaders(args)
 
     optimizer = optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
