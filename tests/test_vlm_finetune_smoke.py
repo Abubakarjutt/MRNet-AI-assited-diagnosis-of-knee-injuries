@@ -114,6 +114,8 @@ def test_run_train_and_eval_only_smoke(mrnet_fixture, tmp_path, monkeypatch):
     the section-5.5 metrics block with a parseable best_val_auc."""
     if not vlm_finetune._HAVE_DEPS:
         pytest.skip("peft/transformers not installed")
+    if not os.environ.get("HF_TOKEN"):
+        pytest.skip("HF_TOKEN not set (gated google/medgemma-4b-it)")
 
     train_args = _args(
         monkeypatch,

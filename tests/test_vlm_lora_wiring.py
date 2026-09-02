@@ -5,6 +5,7 @@ with ``pytest -m "not slow"`` and no model download. The real ``get_peft_model``
 wiring against a tiny/real MedGemma is the ``@slow`` test at the bottom.
 """
 
+import os
 import re
 
 import pytest
@@ -85,6 +86,8 @@ def test_get_peft_model_targets_language_only():
     projector stay frozen while language LoRA params train."""
     if not vlm_finetune._HAVE_DEPS:
         pytest.skip("peft/transformers not installed")
+    if not os.environ.get("HF_TOKEN"):
+        pytest.skip("HF_TOKEN not set (gated google/medgemma-4b-it)")
     # The real model load is the @slow part; it needs HF_TOKEN + MPS.
     from peft import LoraConfig, get_peft_model
 
