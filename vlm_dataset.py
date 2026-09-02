@@ -111,4 +111,7 @@ def collate_fn(batch, processor, train: bool):
 
     out["label"] = item["label"]
     out["exam_id"] = item["exam_id"]
+    # score_exam / _write_predictions read batch["images"] (the raw montage list used
+    # to build the teacher-forced readout conversation); carry it through both branches.
+    out["images"] = item["images"]
     return out
