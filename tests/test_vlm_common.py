@@ -146,3 +146,29 @@ def test_score_exam_favors_one_id(fake_processor, fake_model):
     probs = vlm_common.score_exam(fake_model, fake_processor, images)
     assert probs.shape == (3,)
     assert all(p > 0.99 for p in probs)     # P(one_id) -> 1 at every slot
+
+
+# --- C4: score_exam casts pixel_values to the model dtype -------------------- #
+def test_score_exam_casts_pixel_values_to_model_dtype(fake_processor):
+    import torch
+    from types import SimpleNamespace
+    import vlm_common
+
+    seen = []
+
+    class _M:
+        device = torch.device("cpu")
+        dtype = torch.float64
+
+        def __call__(self, **batch):
+            seen.append(batch["pixel_values"].dtype)
+            T = batch["input_ids"].shape[-1]
+            return SimpleNamespace(logits=torch.zeros(1, T, 512))
+
+        def eval(self):
+            return self
+
+    imgs = [object(), object(), object()]        # fake_processor ignores image content
+    out = vlm_common.score_exam(_M(), fake_processor, imgs)
+    assert out.shape == (3,)
+    assert seen and all(d == torch.float64 for d in seen)
