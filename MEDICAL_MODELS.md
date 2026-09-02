@@ -46,3 +46,61 @@ python train.py \
   Use `--max_train_batches` / `--time_budget_minutes` for short loops.
 - Resize is bicubic + antialias to approximate the SigLIP processor; it is not a
   byte-exact match to `transformers`' PIL pipeline.
+
+## MedGemma-4B LoRA (`vlm_finetune.py`)
+
+A standalone LoRA fine-tune of [`google/medgemma-4b-it`](https://huggingface.co/google/medgemma-4b-it)
+that classifies a knee MRI exam into the three MRNet labels. Each exam's three planes become
+slice montages fed to the vision tower; the answer is a fixed JSON
+(`{"abnormal": d, "acl": d, "meniscus": d}`). Scoring is deterministic and generation-free:
+one teacher-forced forward per exam reads `P("1")` at each value slot via a two-way softmax,
+so the reported `best_val_auc` is the **pooled micro-AUC** constructed identically to
+`train.py`'s — its numbers sit in the same table as the CNN baselines. `per_task_auc` is a
+supplementary line, not part of `train.py`'s block.
+
+LoRA attaches to the **language model only** (`language_model.`-anchored target regex); the
+SigLIP `vision_tower` and `multi_modal_projector` stay frozen (asserted at build time; a
+`< 60M` trainable-param tripwire guards against a leak).
+
+### One-time setup
+
+1. Accept the MedGemma license on the model page.
+2. `export HF_TOKEN=...`
+3. `export PYTORCH_ENABLE_MPS_FALLBACK=1`
+4. `pip install -r requirements.txt` (adds `peft`, `accelerate`, `sentencepiece`)
+
+### Usage
+
+```bash
+# train (few hundred optimizer steps, not full epochs — ~10–25 min/epoch on MPS)
+python vlm_finetune.py --prefix_name medgemma --epochs 3 --grad_accum 8 \
+   --max_train_batches 300 --patience 3 --time_budget_minutes 90
+
+# reload a saved best adapter and score validation only
+python vlm_finetune.py --prefix_name medgemma --eval_only models/medgemma_medgemma_lora_valauc_0.xxxx \
+   --dump_predictions out.tsv
+```
+
+### Flags (key ones)
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--base_model` | `google/medgemma-4b-it` | HF id of the base multimodal model |
+| `--lora_r` / `--lora_alpha` / `--lora_dropout` | `16` / `32` / `0.05` | LoRA adapter hyperparameters |
+| `--slices_per_plane` / `--slice_strategy` | `6` / `uniform` | montage cells per plane and sampling strategy |
+| `--patience` | `3` | early-stop patience on val AUC (`0` disables) |
+| `--eval_only` / `--dump_predictions` | — | reload a saved adapter / write the prediction TSV |
+| `--time_budget_minutes` / `--max_train_batches` | — | budget guards for slow MPS runs |
+
+### Notes
+
+- `attn_implementation="eager"` and `do_pan_and_scan=False` are set everywhere: eager keeps the
+   Gemma-3 sliding-window attention stable on MPS, and disabling pan-and-scan avoids a 3–5×
+   token/memory blowup. Weights load in bf16 (`dtype=`), no `bitsandbytes` 4-bit — needs
+   **≥32 GB** unified memory.
+- The **early-stop divergence is deliberate**: `train.py` keeps a single best checkpoint;
+   `vlm_finetune.py` prunes prior best-adapter dirs and keeps one best-per-run
+   (`<prefix>_medgemma_lora_valauc_<auc>`), because the base model reloads from cache each run.
+- Only the LoRA adapter is saved (`model.save_pretrained`); the ~4B base reloads from the HF
+   cache. Fast tests use a hand-built fake processor/model in `conftest.py`; the real-model
+   paths are `@pytest.mark.slow` (see `tests/test_vlm_real.py`).

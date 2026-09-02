@@ -133,6 +133,8 @@ pip install -r requirements.txt
 `--model_type medsiglip` uses a frozen MedSigLIP vision encoder. See
 [`MEDICAL_MODELS.md`](MEDICAL_MODELS.md).
 
+`vlm_finetune.py` LoRA-fine-tunes `google/medgemma-4b-it` on the same labels; see the MedGemma-4B LoRA section of [`MEDICAL_MODELS.md`](MEDICAL_MODELS.md).
+
 ## Training
 
 ### Basic Example
