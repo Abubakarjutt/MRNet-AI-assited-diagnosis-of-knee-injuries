@@ -39,9 +39,15 @@ def build_backbone(name, pretrained=True):
         backbone = models.efficientnet_b0(
             weights=EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
         )
+    elif name == "medsiglip":
+        from medical_encoders import MedSigLIPEncoder
+
+        encoder = MedSigLIPEncoder()  # `pretrained` intentionally ignored
+        return encoder, encoder.feature_dim
     else:
         raise ValueError(
-            "Unsupported backbone. Choose from: resnet18, mobilenet_v3_small, efficientnet_b0"
+            "Unsupported backbone. Choose from: resnet18, mobilenet_v3_small, "
+            "efficientnet_b0, medsiglip"
         )
 
     return _strip_classifier(backbone, name)
