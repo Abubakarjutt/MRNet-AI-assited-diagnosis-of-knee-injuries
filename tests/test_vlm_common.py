@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 from sklearn import metrics
 
 import vlm_common
@@ -172,3 +173,46 @@ def test_score_exam_casts_pixel_values_to_model_dtype(fake_processor):
     out = vlm_common.score_exam(_M(), fake_processor, imgs)
     assert out.shape == (3,)
     assert seen and all(d == torch.float64 for d in seen)
+
+
+# --- I7: the pos-1 causal alignment in score_exam is under test ----------------- #
+def _readout_ids(fake_processor):
+    imgs = [Image.new("RGB", (32, 32)) for _ in range(3)]
+    conv = vlm_common.build_conversation(
+        imgs, answer=vlm_common.format_answer((0, 0, 0))
+    )
+    batch = fake_processor.apply_chat_template(
+        conv, add_generation_prompt=False, tokenize=True,
+        return_dict=True, return_tensors="pt", do_pan_and_scan=False,
+    )
+    return imgs, batch["input_ids"][0]
+
+
+def test_score_exam_reads_logits_at_slot_minus_one(fake_model, fake_processor):
+    """Causal-LM convention: P(1) for a value slot is read at pos-1. Boosting one_id at
+    exactly the slot-minus-one rows must drive every returned p1 -> 1."""
+    imgs, ids = _readout_ids(fake_processor)
+    slots = vlm_common.locate_answer_slots(fake_processor, ids)
+    _zero_id, one_id = vlm_common.digit_token_ids(fake_processor)
+    T = int(ids.shape[0])
+    logits = torch.zeros(1, T, fake_model.vocab_size)
+    for s in slots:
+        logits[0, s - 1, one_id] = 50.0
+    fake_model._logits = logits
+    probs = vlm_common.score_exam(fake_model, fake_processor, imgs)
+    assert np.allclose(probs, 1.0, atol=1e-3), probs
+
+
+def test_score_exam_ignores_logits_at_the_slot_itself(fake_model, fake_processor):
+    """Negative control: boosting one_id AT the slot row (pos, not pos-1) must NOT move
+    p1 — rules out an off-by-one in the other direction."""
+    imgs, ids = _readout_ids(fake_processor)
+    slots = vlm_common.locate_answer_slots(fake_processor, ids)
+    _zero_id, one_id = vlm_common.digit_token_ids(fake_processor)
+    T = int(ids.shape[0])
+    logits = torch.zeros(1, T, fake_model.vocab_size)
+    for s in slots:
+        logits[0, s, one_id] = 50.0
+    fake_model._logits = logits
+    probs = vlm_common.score_exam(fake_model, fake_processor, imgs)
+    assert np.allclose(probs, 0.5, atol=1e-3), probs

@@ -39,8 +39,9 @@ def test_real_digit_token_ids_are_single_tokens():
 def test_real_score_exam_returns_finite_probs(mrnet_fixture):
     _skip_if_unavailable()
     processor, model, _ = vlm_finetune.build_model(
-        vlm_finetune.parse_arguments(), torch.device("cpu")
-     )
+        vlm_finetune.parse_arguments(["--prefix_name", "slow-real"]),
+        torch.device("cpu"),
+    )
     import vlm_dataset
     ds = vlm_dataset.MRVLMDataset(
         str(mrnet_fixture), train=False, k=6, grid=(3, 2), cell=448,
