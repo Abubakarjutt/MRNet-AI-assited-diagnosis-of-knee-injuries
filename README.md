@@ -128,6 +128,11 @@ pip install -r requirements.txt
 - `autoresearch_loop.py`: persistent architecture / hyperparameter search
 - `research_controller.py`: proposes next experiments based on history and priors
 
+## Pretrained medical models
+
+`--model_type medsiglip` uses a frozen MedSigLIP vision encoder. See
+[`MEDICAL_MODELS.md`](MEDICAL_MODELS.md).
+
 ## Training
 
 ### Basic Example
