@@ -1,4 +1,8 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
+import torch.nn as nn
 
 import medical_encoders
 
@@ -75,6 +79,71 @@ def test_fastmrnet_medsiglip_checkpoint_excludes_tower(stub_medsiglip, tmp_path)
     reloaded = torch.load(path, weights_only=True)
     result = model.load_state_dict(reloaded, strict=False)
     assert all("encoder.tower" not in key for key in result.unexpected_keys)
+
+
+class _NoVisionModel(nn.Module):
+    """Composite model that never exposes a `.vision_model` attribute."""
+
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(3, 4)
+
+
+class _NoVisionAutoModel:
+    @staticmethod
+    def from_pretrained(*args, **kwargs):
+        return _NoVisionModel()
+
+
+def test_encoder_construction_without_vision_model_raises(monkeypatch):
+    monkeypatch.setattr("medical_encoders.AutoModel", _NoVisionAutoModel)
+    with pytest.raises(AttributeError, match="has no .vision_model"):
+        medical_encoders.MedSigLIPEncoder()
+
+
+class _HeadlessTower(nn.Module):
+    """Vision tower whose output carries `pooler_output=None` (vision_use_head=False)."""
+
+    def __init__(self, feature_dim=1152):
+        super().__init__()
+        self.proj = nn.Linear(3, feature_dim)
+
+    def forward(self, pixel_values):
+        # last_hidden_state present, pooler_output deliberately None
+        return SimpleNamespace(
+            last_hidden_state=self.proj(pixel_values.mean(dim=(2, 3))).unsqueeze(1),
+            pooler_output=None,
+        )
+
+
+class _HeadlessSiglip(nn.Module):
+    def __init__(self, feature_dim=1152):
+        super().__init__()
+        self.vision_model = _HeadlessTower(feature_dim)
+
+    def get_image_features(self, pixel_values):
+        return self.vision_model.proj(pixel_values.mean(dim=(2, 3)))
+
+
+class _HeadlessAutoModel:
+    @staticmethod
+    def from_pretrained(*args, **kwargs):
+        return _HeadlessSiglip()
+
+
+def test_forward_uses_get_image_features_when_pooler_output_is_none(monkeypatch):
+    monkeypatch.setattr("medical_encoders.AutoModel", _HeadlessAutoModel)
+    encoder = medical_encoders.MedSigLIPEncoder(chunk_size=4)
+    out = encoder(torch.randn(6, 3, 448, 448))
+    assert out.shape == (6, 1152)
+    assert out.dtype == torch.float32
+
+
+def test_named_parameters_contains_only_tower_keys(stub_medsiglip):
+    encoder = medical_encoders.MedSigLIPEncoder()
+    keys = list(dict(encoder.named_parameters()).keys())
+    assert keys, "expected the stub tower's parameters to be tracked"
+    assert all(key.startswith("tower.") for key in keys), keys
 
 
 def test_encoder_actually_micro_batches(stub_medsiglip):

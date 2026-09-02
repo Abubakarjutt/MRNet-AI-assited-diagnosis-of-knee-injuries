@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import time
 from datetime import datetime
 
@@ -32,6 +33,8 @@ from dataloader import MRMultiPlaneDataset, MRVolumeAugmentor
 
 
 torch.set_float32_matmul_precision("high")
+
+_warned_medsiglip_image_size = False
 
 
 def safe_confusion_counts(y_true, y_pred):
@@ -89,6 +92,13 @@ def build_train_augmentor(args):
 
 def resolve_input_spec(args):
     if args.model_type == "medsiglip":
+        global _warned_medsiglip_image_size
+        if getattr(args, "image_size", 224) != 224 and not _warned_medsiglip_image_size:
+            print(
+                f"[medsiglip] --image_size {args.image_size} ignored; forced to 448",
+                file=sys.stderr,
+            )
+            _warned_medsiglip_image_size = True
         return {
             "image_size": 448,
             "mean": utils.SIGLIP_MEAN,
@@ -241,9 +251,9 @@ def iterate_epoch(
             break
 
         label = label.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
-        sagittal, coronal, axial = prepare_inputs(volumes, device, args)
 
         if is_train:
+            sagittal, coronal, axial = prepare_inputs(volumes, device, args)
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):

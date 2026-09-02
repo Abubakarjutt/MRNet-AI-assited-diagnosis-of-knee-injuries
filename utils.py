@@ -57,6 +57,8 @@ def prepare_volume_batch(volume, device, image_size=224, channels_last=False,
     )
     flat = flat.reshape(batch_size, slices, channels, image_size, image_size)
 
+    flat = flat.clamp_(0.0, 1.0)
+
     flat = (flat - mean.to(device)) / std.to(device)
 
     return flat

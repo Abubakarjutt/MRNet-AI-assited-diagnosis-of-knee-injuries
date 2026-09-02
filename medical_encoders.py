@@ -17,9 +17,17 @@ class MedSigLIPEncoder(nn.Module):
     def __init__(self, model_id="google/medsiglip-448", chunk_size=32):
         super().__init__()
         full = AutoModel.from_pretrained(model_id, dtype=torch.float32)
-        # Prefer the dedicated vision tower; some transformers versions expose it
-        # only on the composite model.
-        self.tower = getattr(full, "vision_model", full)
+        tower = getattr(full, "vision_model", None)
+        if tower is None:
+            raise AttributeError(
+                f"{type(full).__name__} has no .vision_model; cannot use it as a "
+                "frozen vision tower for MedSigLIPEncoder."
+            )
+        self.tower = tower
+        # A bound method, not an nn.Module: nn.Module.__setattr__ stores it plainly
+        # so it never enters state_dict()/parameters(). Used only as the
+        # pooler_output fallback in forward().
+        self._image_features_fallback = getattr(full, "get_image_features", None)
         self.feature_dim = 1152
         self.chunk_size = int(chunk_size)
 
@@ -41,7 +49,12 @@ class MedSigLIPEncoder(nn.Module):
             output = self.tower(pixel_values=chunk)
             pooled = getattr(output, "pooler_output", None)
             if pooled is None:
-                pooled = output[1] if isinstance(output, (tuple, list)) else output
+                if self._image_features_fallback is None:
+                    raise RuntimeError(
+                        "SigLIP tower returned no pooler_output and the model exposes "
+                        "no get_image_features fallback."
+                    )
+                pooled = self._image_features_fallback(pixel_values=chunk)
             pooled_chunks.append(pooled.float())
         return torch.cat(pooled_chunks, dim=0)
 
