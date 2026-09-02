@@ -85,7 +85,12 @@ def collate_fn(batch, processor, train: bool):
       `labels` (prompt masked to -100, real ids from the assistant turn on).
     - train=False -> omits the assistant answer, add_generation_prompt=True (generation mode);
       no `labels` key.
-    Always attaches the raw `label` tensor and `exam_id`."""
+    Always attaches the raw `label` tensor and `exam_id`.
+
+    Note: on the eval path the scoring readout (vlm_common.score_exam) re-runs the chat
+    template from item["images"] to build its own all-zeros teacher-forced conversation,
+    so the train=False input_ids / pixel_values here are not consumed by AUC scoring.
+    They are kept for parity, debugging, and a future generation-based eval."""
     if len(batch) != 1:
         raise ValueError(f"collate_fn expects batch_size 1, got {len(batch)}")
     item = batch[0]

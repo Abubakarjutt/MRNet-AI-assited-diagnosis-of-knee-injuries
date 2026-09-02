@@ -54,6 +54,17 @@ _TRAINABLE_TRIPWIRE_M = 60.0        # LoRA leak guard (spec section 9.3)
 processor_ref = {"processor": None}    # filled by run() so build_loaders can close over it
 
 
+# collate_fn attaches these bookkeeping keys next to the processor's real outputs
+# (input_ids / attention_mask / pixel_values / labels / token_type_ids / ...). They must
+# not reach model.forward — the real Gemma3 signature rejects unknown kwargs. A denylist
+# (not an allowlist) keeps any *valid* future processor output flowing through untouched.
+_COLLATE_EXTRA_KEYS = frozenset({"label", "exam_id", "images"})
+
+
+def _forward_kwargs(batch):
+    return {k: v for k, v in batch.items() if k not in _COLLATE_EXTRA_KEYS}
+
+
 def load_base(base_model, device):
     """Load the processor + bf16 base model (eager attention, MPS device map)."""
     if not _HAVE_DEPS:
@@ -126,34 +137,48 @@ def build_loaders(args):
     return make(True), make(False)
 
 
-def _write_predictions(path, val_loader, model, processor, device, max_val_batches):
-    """TSV: exam_id, p_abnormal, p_acl, p_meniscus, y_abnormal, y_acl, y_meniscus."""
+def _write_predictions(path, exam_ids, y_pred, y_true):
+    """TSV: exam_id, p_abnormal, p_acl, p_meniscus, y_abnormal, y_acl, y_meniscus.
+    Rows come straight from evaluate()'s single scoring pass — no second forward."""
     header = "exam_id\t" + "\t".join(TASKS) + "\t" + "\t".join(TASKS) + "\n"
     with open(path, "w") as handle:
         handle.write(header)
-        for batch_index, batch in enumerate(val_loader):
-            if max_val_batches is not None and batch_index >= max_val_batches:
-                break
-            probs = score_exam(model, processor, batch["images"])
-            label = batch["label"].int().tolist()
+        for exam_id, prow, yrow in zip(exam_ids, y_pred, y_true):
             handle.write(
-                f"{batch['exam_id']}\t"
-                + "\t".join(f"{p:.6f}" for p in probs) + "\t"
-                + "\t".join(f"{y}" for y in label) + "\n"
+                f"{exam_id}\t"
+                + "\t".join(f"{float(p):.6f}" for p in prow) + "\t"
+                + "\t".join(f"{int(y)}" for y in yrow) + "\n"
             )
 
 
 def evaluate(model, processor, val_loader, device, max_val_batches=None,
              dump_predictions=None):
-    """Per-exam teacher-forced scoring -> pooled micro-AUC + per-task AUC + mean val CE."""
+    """Per-exam teacher-forced scoring -> pooled micro-AUC + per-task AUC + mean val CE.
+
+    Two forwards per exam: (1) the generation-free readout (score_exam) that yields the
+    AUC rows, and (2) a teacher-forced masked forward (train-style collation) whose .loss
+    is averaged into best_val_loss (spec §5.4)."""
     model.eval()
-    y_true_rows, y_pred_rows = [], []
+    y_true_rows, y_pred_rows, exam_ids = [], [], []
+    ce_sum, ce_n = 0.0, 0
     for batch_index, batch in enumerate(val_loader):
         if max_val_batches is not None and batch_index >= max_val_batches:
             break
-        probs = score_exam(model, processor, batch["images"])      # np.ndarray[3]
+        # score_exam re-templates from images (all-zeros teacher-forced readout); the
+        # val loader's collated input_ids/pixel_values are intentionally unused here.
+        probs = score_exam(model, processor, batch["images"])          # np.ndarray[3]
         y_true_rows.append(batch["label"].int().tolist())
         y_pred_rows.append(list(probs))
+        exam_ids.append(batch["exam_id"])
+
+        tf_item = {"images": batch["images"], "label": batch["label"],
+                   "exam_id": batch["exam_id"]}
+        tf_batch = _batch_to_model(collate_fn([tf_item], processor, train=True), model)
+        with torch.no_grad():
+            ce = model(**_forward_kwargs(tf_batch)).loss
+        if ce is not None:
+            ce_sum += float(ce)
+            ce_n += 1
 
     y_true = np.array(y_true_rows, dtype=np.int64)
     y_pred = np.array(y_pred_rows, dtype=np.float64)
@@ -162,10 +187,10 @@ def evaluate(model, processor, val_loader, device, max_val_batches=None,
         float(compute_auc(y_true[:, i].tolist(), y_pred[:, i].tolist()))
         for i in range(len(TASKS))
     ]
+    val_ce = (ce_sum / ce_n) if ce_n else None
     if dump_predictions:
-        _write_predictions(dump_predictions, val_loader, model, processor, device,
-                           max_val_batches)
-    return float(pooled_auc), per_task, None, y_pred, y_true
+        _write_predictions(dump_predictions, exam_ids, y_pred, y_true)
+    return float(pooled_auc), per_task, val_ce, y_pred, y_true
 
 
 def _batch_to_model(batch, model):
@@ -203,7 +228,7 @@ def train_one_epoch(model, optimizer, scheduler, train_loader, device, args,
                   f"{args.time_budget_minutes:.2f} minute budget.")
             break
         batch = _batch_to_model(batch, model)
-        loss = model(**batch).loss / float(args.grad_accum)
+        loss = model(**_forward_kwargs(batch)).loss / float(args.grad_accum)
         loss.backward()
         running_loss += loss.item()
         n_seen += 1
@@ -308,6 +333,7 @@ def run(args):
     )
 
     best_val_auc = 0.0
+    best_per_task = [0.5] * len(TASKS)
     best_val_loss = float("inf")
     best_epoch = -1
     patience_counter = 0
@@ -328,7 +354,7 @@ def run(args):
         )
         maybe_sync(device)
 
-        pooled_auc, per_task, val_ce, y_pred, y_true = evaluate(
+        pooled_auc, per_task, val_ce, _, _ = evaluate(
             model, processor, val_loader, device, max_val_batches=args.max_val_batches,
         )
         epochs_ran = epoch + 1
@@ -341,6 +367,7 @@ def run(args):
         if pooled_auc > best_val_auc:
             best_val_auc = float(pooled_auc)
             best_epoch = epoch + 1
+            best_per_task = per_task
             _prune_prior_adapter_dirs(args.prefix_name)
             out_dir = _adapter_dir(args.prefix_name, best_val_auc)
             os.makedirs(out_dir, exist_ok=True)
@@ -358,12 +385,12 @@ def run(args):
             best_val_loss = float(val_ce)
 
     training_seconds = time.time() - t_start_training
-    _print_metrics(args, device, best_val_auc, best_val_loss, per_task,
+    _print_metrics(args, device, best_val_auc, best_val_loss, best_per_task,
                    training_seconds, epochs_ran, best_epoch, full_M, trainable_M)
     return best_val_auc
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--prefix_name", type=str, required=True)
     parser.add_argument("--data_root", type=str, default="MRNet-v1.0")
@@ -388,7 +415,7 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--mmap", type=int, choices=[0, 1], default=1)
     parser.add_argument("--cache_size", type=int, default=32)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":

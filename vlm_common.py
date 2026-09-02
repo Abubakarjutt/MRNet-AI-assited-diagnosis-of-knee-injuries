@@ -204,26 +204,42 @@ def locate_answer_slots(processor, input_ids):
     `input_ids` (image placeholders already expanded). Method: tokenize
     format_answer((0,0,0)) alone, find it as the tail subsequence of input_ids, and return the
     positions whose token equals the zero digit id. Assert each decodes (stripped) to "0".
+    Fallback: if the exact isolated tokenization is not a contiguous run (real SentencePiece
+    can merge the surrounding punctuation/spacing differently in-context), use the last three
+    positions equal to zero_id, since the all-zeros answer is the final content in the sequence.
     """
     tok = processor.tokenizer
     zero_id, _one_id = digit_token_ids(processor)
     answer_ids = tok(format_answer((0, 0, 0)), add_special_tokens=False)["input_ids"]
 
     flat = input_ids.reshape(-1).tolist() if torch.is_tensor(input_ids) else list(input_ids)
-    start = _find_last_subsequence(flat, answer_ids)
-    if start is None:
-        raise ValueError("answer subsequence not found in input_ids")
 
-    slots = []
-    for j, tid in enumerate(answer_ids):
-        if tid == zero_id:
-            abs_pos = start + j
-            if tok.decode([tid]).strip() != "0":
-                raise ValueError(f"slot token {tid} decoded to {tok.decode([tid])!r}, expected '0'")
-            slots.append(abs_pos)
+    start = _find_last_subsequence(flat, answer_ids)
+    if start is not None:
+        slots = [start + j for j, tid in enumerate(answer_ids) if tid == zero_id]
+    else:
+        # Exact tokenization did not appear as a contiguous run: real SentencePiece can
+        # merge the surrounding punctuation/spacing differently in-context than in
+        # isolation. digit_token_ids has already proven the three value tokens render as
+        # the standalone zero_id, and the all-zeros answer is the final content in the
+        # sequence, so the last three positions equal to zero_id are the slots.
+        slots = [i for i, tid in enumerate(flat) if tid == zero_id][-3:]
+
+    slots = sorted(slots)
+    for abs_pos in slots:
+        tid = flat[abs_pos]
+        if tok.decode([tid]).strip() != "0":
+            raise ValueError(
+                f"slot token {tid} decoded to {tok.decode([tid])!r}, expected '0'"
+            )
 
     if len(slots) != 3:
-        raise ValueError(f"expected 3 digit slots, found {len(slots)}")
+        tail = tok.decode(flat[-40:])
+        raise ValueError(
+            f"expected 3 digit slots, found {len(slots)} "
+            f"(exact-match {'hit' if start is not None else 'missed'}; "
+            f"sequence tail decodes to {tail!r})"
+        )
     if any(slots[i] >= slots[i + 1] for i in range(len(slots) - 1)):
         raise ValueError(f"slots not strictly increasing: {slots}")
     if any(s >= len(flat) for s in slots):
