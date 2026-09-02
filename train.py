@@ -87,14 +87,36 @@ def build_train_augmentor(args):
         motion_prob=args.aug_motion_prob,
     )
 
+def resolve_input_spec(args):
+    if args.model_type == "medsiglip":
+        return {
+            "image_size": 448,
+            "mean": utils.SIGLIP_MEAN,
+            "std": utils.SIGLIP_STD,
+            "interp_mode": "bicubic",
+            "antialias": True,
+        }
+    return {
+        "image_size": args.image_size,
+        "mean": utils.IMAGENET_MEAN,
+        "std": utils.IMAGENET_STD,
+        "interp_mode": "bilinear",
+        "antialias": False,
+    }
+
 def prepare_inputs(volumes, device, args):
     channels_last = bool(args.channels_last)
+    spec = resolve_input_spec(args)
     sagittal, coronal, axial = (
         utils.prepare_volume_batch(
             volume,
             device=device,
-            image_size=args.image_size,
+            image_size=spec["image_size"],
             channels_last=channels_last,
+            mean=spec["mean"],
+            std=spec["std"],
+            interp_mode=spec["interp_mode"],
+            antialias=spec["antialias"],
         )
         for volume in volumes
     )

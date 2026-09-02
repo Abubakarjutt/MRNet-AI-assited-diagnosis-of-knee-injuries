@@ -1,6 +1,9 @@
 import torch
+from types import SimpleNamespace
 
+import train
 import utils
+import utils as utils_module
 
 
 def test_siglip_constants_shape_and_value():
@@ -35,3 +38,37 @@ def test_prepare_volume_batch_siglip_spec_maps_to_unit_range():
     assert torch.isfinite(out).all()
     assert out.max().item() <= 1.0 + 1e-4
     assert out.min().item() >= -1.0 - 1e-4
+
+
+def test_resolve_input_spec_medsiglip():
+    args = SimpleNamespace(model_type="medsiglip", image_size=224)
+    spec = train.resolve_input_spec(args)
+    assert spec["image_size"] == 448
+    assert spec["interp_mode"] == "bicubic"
+    assert spec["antialias"] is True
+    assert spec["mean"] is utils_module.SIGLIP_MEAN
+    assert spec["std"] is utils_module.SIGLIP_STD
+
+
+def test_resolve_input_spec_default_backbone():
+    args = SimpleNamespace(model_type="mobilenet_v3_small", image_size=224)
+    spec = train.resolve_input_spec(args)
+    assert spec["image_size"] == 224
+    assert spec["interp_mode"] == "bilinear"
+    assert spec["antialias"] is False
+    assert spec["mean"] is utils_module.IMAGENET_MEAN
+    assert spec["std"] is utils_module.IMAGENET_STD
+
+
+def test_prepare_inputs_uses_medsiglip_spec(mrnet_fixture):
+    from dataloader import MRMultiPlaneDataset
+
+    dataset = MRMultiPlaneDataset(str(mrnet_fixture), train=False)
+    volumes, _label, _w, _id = dataset[0]
+    args = SimpleNamespace(model_type="medsiglip", image_size=224, channels_last=0)
+
+    sagittal, coronal, axial = train.prepare_inputs(volumes, torch.device("cpu"), args)
+    for plane in (sagittal, coronal, axial):
+        assert plane.shape[-2:] == (448, 448)
+        assert plane.min().item() >= -1.0 - 1e-3
+        assert plane.max().item() <= 1.0 + 1e-3
