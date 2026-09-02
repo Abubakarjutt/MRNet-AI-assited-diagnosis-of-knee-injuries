@@ -104,9 +104,13 @@ python vlm_finetune.py --prefix_name medgemma --eval_only models/medgemma_medgem
    Gemma-3 sliding-window attention stable on MPS, and disabling pan-and-scan avoids a 3–5×
    token/memory blowup. Weights load in bf16 (`dtype=`), no `bitsandbytes` 4-bit — needs
    **≥32 GB** unified memory.
-- The **early-stop divergence is deliberate**: `train.py` keeps a single best checkpoint;
-   `vlm_finetune.py` prunes prior best-adapter dirs and keeps one best-per-run
-   (`<prefix>_medgemma_lora_valauc_<auc>`), because the base model reloads from cache each run.
+- **Two deliberate divergences from `train.py`** (spec §5.4): (1) early stopping keys on the
+   **pooled val AUC** — `--patience` epochs with no AUC gain — whereas `train.py` early-stops
+   on val *loss*; here val AUC is the entire point of the run. (2) The LR schedule is
+   **cosine-with-warmup** across the whole run (`get_cosine_schedule_with_warmup`), not
+   `train.py`'s `ReduceLROnPlateau` — a few-hundred-step LoRA run never plateaus meaningfully.
 - Only the LoRA adapter is saved (`model.save_pretrained`); the ~4B base reloads from the HF
-   cache. Fast tests use a hand-built fake processor/model in `conftest.py`; the real-model
-   paths are `@pytest.mark.slow` (see `tests/test_vlm_real.py`).
+   cache. One best per run: on each new best, prior `<prefix>_medgemma_lora_valauc_*` dirs
+   are pruned before the new adapter is written. Fast tests use a hand-built fake
+   processor/model in `conftest.py`; the real-model paths are `@pytest.mark.slow` (see
+   `tests/test_vlm_real.py`).
