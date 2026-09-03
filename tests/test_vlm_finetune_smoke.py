@@ -93,6 +93,41 @@ def test_prune_is_noop_when_no_models_dir(tmp_path, monkeypatch):
     vlm_finetune._prune_prior_adapter_dirs("run_x")      # must not raise
 
 
+def test_prune_keeps_the_freshly_saved_dir(tmp_path, monkeypatch):
+    models = tmp_path / "models"
+    fresh = models / "run_x_medgemma_lora_valauc_0.9100"
+    stale = models / "run_x_medgemma_lora_valauc_0.8800"
+    fresh.mkdir(parents=True)
+    stale.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    vlm_finetune._prune_prior_adapter_dirs("run_x", keep=str(fresh))
+    assert fresh.is_dir() is True          # the just-saved best survives its own prune
+    assert stale.is_dir() is False
+
+
+# --- resume-from-checkpoint (chained one-epoch runs) ----------------------- #
+def test_parse_valauc_recovers_score_from_dir_name():
+    assert vlm_finetune._parse_valauc(
+        "models/medgemma_full_medgemma_lora_valauc_0.7877") == 0.7877
+    assert vlm_finetune._parse_valauc(
+        "/abs/path/run_x_medgemma_lora_valauc_0.9100/") == 0.9100
+
+
+def test_parse_valauc_is_zero_without_a_tag():
+    assert vlm_finetune._parse_valauc(None) == 0.0
+    assert vlm_finetune._parse_valauc("models/some_hand_named_adapter") == 0.0
+
+
+def test_resume_adapter_arg_defaults_none_and_parses(monkeypatch):
+    monkeypatch.setattr("sys.argv",
+                        ["vlm_finetune.py", "--prefix_name", "smoke"])
+    assert vlm_finetune.parse_arguments().resume_adapter is None
+    monkeypatch.setattr("sys.argv",
+                        ["vlm_finetune.py", "--prefix_name", "smoke",
+                         "--resume_adapter", "models/x_valauc_0.80"])
+    assert vlm_finetune.parse_arguments().resume_adapter == "models/x_valauc_0.80"
+
+
 # --- trainable count --------------------------------------------------------- #
 def test_trainable_param_count_counts_only_grad():
     model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))

@@ -11,6 +11,7 @@ without them; the real-model paths assert their presence. The fast suite exercis
 
 import argparse
 import os
+import re
 import shutil
 import time
 
@@ -274,14 +275,28 @@ def _adapter_dir(prefix, pooled_auc):
     return os.path.join("models", f"{prefix}_medgemma_lora_valauc_{pooled_auc:.4f}")
 
 
-def _prune_prior_adapter_dirs(prefix):
-    """One-best-per-run: delete prior adapter dirs whose name contains prefix."""
+def _parse_valauc(path):
+    """Recover the pooled AUC that _adapter_dir baked into an adapter directory name.
+    Returns 0.0 when the name carries no ``valauc_<float>`` tag (so a resumed epoch that
+    scores worse than the checkpoint it started from still can't overwrite the best)."""
+    if not path:
+        return 0.0
+    match = re.search(r"valauc_([0-9]*\.?[0-9]+)", os.path.basename(os.path.normpath(path)))
+    return float(match.group(1)) if match else 0.0
+
+
+def _prune_prior_adapter_dirs(prefix, keep=None):
+    """One-best-per-run: delete prior adapter dirs whose name contains prefix.
+    ``keep`` (a dir path) is never deleted -- pass the freshly-saved adapter so the
+    prune runs *after* the save, leaving no window where a crash loses both."""
     models_dir = os.path.abspath("models")
     if not os.path.isdir(models_dir):
         return
+    keep_abs = os.path.abspath(keep) if keep else None
     for name in os.listdir(models_dir):
-        if prefix in name and os.path.isdir(os.path.join(models_dir, name)):
-            shutil.rmtree(os.path.join(models_dir, name), ignore_errors=True)
+        full = os.path.join(models_dir, name)
+        if prefix in name and os.path.isdir(full) and full != keep_abs:
+            shutil.rmtree(full, ignore_errors=True)
 
 
 def _rebuild_with_adapter(args, device):
@@ -289,6 +304,20 @@ def _rebuild_with_adapter(args, device):
     processor, model = load_base(args.base_model, device)
     model = PeftModel.from_pretrained(model, args.eval_only)
     trainable_M = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    return processor, model, trainable_M
+
+
+def _resume_lora(args, device):
+    """Warm-start training from an existing LoRA adapter dir. Same shape as
+    build_model (frozen base + trainable language LoRA + freeze assert) but the
+    adapter weights come from disk instead of a fresh init -- this box cannot
+    survive more than ~1 epoch of MedGemma-4B training before macOS OOM-kills it,
+    so a chained one-epoch-per-process loop resumes the best checkpoint each time."""
+    processor, model = load_base(args.base_model, device)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model = PeftModel.from_pretrained(model, args.resume_adapter, is_trainable=True)
+    trainable_M = assert_freeze(model)
     return processor, model, trainable_M
 
 
@@ -331,7 +360,11 @@ def run(args):
                        per_task, 0.0, 0, -1, full_M, trainable_M)
         return float(pooled_auc)
 
-    processor, model, trainable_M = build_model(args, device)
+    if args.resume_adapter is not None:
+        processor, model, trainable_M = _resume_lora(args, device)
+        print(f"--- resumed LoRA from {args.resume_adapter}")
+    else:
+        processor, model, trainable_M = build_model(args, device)
     processor_ref["processor"] = processor
     full_M = sum(p.numel() for p in model.parameters()) / 1e6
     train_loader, val_loader = build_loaders(args)
@@ -349,7 +382,9 @@ def run(args):
         num_training_steps=max(1, total_steps),
     )
 
-    best_val_auc = 0.0
+    # A resumed run must clear the checkpoint it started from, not 0.0, or a worse
+    # epoch would still "improve" on 0.0 and overwrite the better adapter on disk.
+    best_val_auc = _parse_valauc(args.resume_adapter) if args.resume_adapter else 0.0
     best_per_task = [0.5] * len(TASKS)
     best_val_loss = float("inf")
     best_epoch = -1
@@ -386,10 +421,10 @@ def run(args):
             best_val_auc = float(pooled_auc)
             best_epoch = epoch + 1
             best_per_task = per_task
-            _prune_prior_adapter_dirs(args.prefix_name)
             out_dir = _adapter_dir(args.prefix_name, best_val_auc)
             os.makedirs(out_dir, exist_ok=True)
             model.save_pretrained(out_dir)
+            _prune_prior_adapter_dirs(args.prefix_name, keep=out_dir)
             print(f"Best adapter saved (val AUC {best_val_auc:.4f}) -> {out_dir}")
             patience_counter = 0
         else:
@@ -429,6 +464,9 @@ def parse_arguments(argv=None):
     parser.add_argument("--max_train_batches", type=int, default=None)
     parser.add_argument("--max_val_batches", type=int, default=None)
     parser.add_argument("--eval_only", type=str, default=None)
+    parser.add_argument("--resume_adapter", type=str, default=None,
+                        help="warm-start training from this LoRA adapter dir "
+                             "(kept trainable); for chained one-epoch runs")
     parser.add_argument("--dump_predictions", type=str, default=None)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--mmap", type=int, choices=[0, 1], default=1)

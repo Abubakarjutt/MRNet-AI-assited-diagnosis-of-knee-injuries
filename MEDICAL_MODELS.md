@@ -85,6 +85,13 @@ python vlm_finetune.py --prefix_name medgemma --epochs 3 --grad_accum 8 \
 # reload a saved best adapter and score validation only
 python vlm_finetune.py --prefix_name medgemma --eval_only models/medgemma_medgemma_lora_valauc_0.xxxx \
    --dump_predictions out.tsv
+
+# constrained-hardware multi-epoch training: one epoch per process, each resuming
+# the best adapter on disk (a macOS OOM kill then costs <=1 epoch, not the whole run)
+scripts/chain_finetune.sh 8 medgemma_full /path/to/MRNet-v1.0
+# or a single manual resume step:
+python vlm_finetune.py --prefix_name medgemma_full --epochs 1 \
+   --resume_adapter models/medgemma_full_medgemma_lora_valauc_0.xxxx
 ```
 
 ### Flags (key ones)
@@ -96,6 +103,7 @@ python vlm_finetune.py --prefix_name medgemma --eval_only models/medgemma_medgem
 | `--slices_per_plane` / `--slice_strategy` | `6` / `uniform` | montage cells per plane and sampling strategy |
 | `--patience` | `3` | early-stop patience on val AUC (`0` disables) |
 | `--eval_only` / `--dump_predictions` | — | reload a saved adapter / write the prediction TSV |
+| `--resume_adapter` | — | warm-start training from a saved LoRA adapter dir (kept trainable); `best_val_auc` is seeded from its `valauc_<f>` tag so a worse epoch can't overwrite it |
 | `--time_budget_minutes` / `--max_train_batches` | — | budget guards for slow MPS runs |
 
 ### Notes
@@ -110,7 +118,10 @@ python vlm_finetune.py --prefix_name medgemma --eval_only models/medgemma_medgem
    **cosine-with-warmup** across the whole run (`get_cosine_schedule_with_warmup`), not
    `train.py`'s `ReduceLROnPlateau` — a few-hundred-step LoRA run never plateaus meaningfully.
 - Only the LoRA adapter is saved (`model.save_pretrained`); the ~4B base reloads from the HF
-   cache. One best per run: on each new best, prior `<prefix>_medgemma_lora_valauc_*` dirs
-   are pruned before the new adapter is written. Fast tests use a hand-built fake
-   processor/model in `conftest.py`; the real-model paths are `@pytest.mark.slow` (see
+   cache. One best per run: on each new best the adapter is written first, *then* prior
+   `<prefix>_medgemma_lora_valauc_*` dirs are pruned (the new dir is passed as `keep=`), so a
+   crash mid-save never leaves zero checkpoints. On a `--resume_adapter` run `best_val_auc`
+   starts at the checkpoint's own score, so an epoch that regresses saves nothing and the
+   better prior adapter is left untouched. Fast tests use a hand-built fake processor/model
+   in `conftest.py`; the real-model paths are `@pytest.mark.slow` (see
    `tests/test_vlm_real.py`).
