@@ -41,6 +41,17 @@ def maybe_sync(device):
         torch.mps.synchronize()
 
 
+def maybe_empty_cache(device):
+    """Release the allocator's cached blocks. On MPS the cache is not reclaimed under
+    memory pressure, so a long training epoch leaves no headroom for the memory-heavier
+    validation pass (score_exam + a second teacher-forced forward per exam). Called
+    between train and eval, and periodically inside the eval loop."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+
 # Anchored on `language_model.` but tolerant of the `model.` wrapper that
 # Gemma3ForConditionalGeneration adds (real names: model.language_model.layers.N...).
 # PEFT uses re.fullmatch, so the leading `(?:.*\.)?` is load-bearing. Still leak-proof:
@@ -179,6 +190,12 @@ def evaluate(model, processor, val_loader, device, max_val_batches=None,
         if ce is not None:
             ce_sum += float(ce)
             ce_n += 1
+
+        # Two forwards per exam accumulate cached allocations that MPS will not
+        # reclaim under pressure; drain them periodically so a long val pass on
+        # this box does not get OOM-killed mid-loop.
+        if (batch_index + 1) % 16 == 0:
+            maybe_empty_cache(device)
 
     y_true = np.array(y_true_rows, dtype=np.int64)
     y_pred = np.array(y_pred_rows, dtype=np.float64)
@@ -353,6 +370,7 @@ def run(args):
             global_step, t_start_training,
         )
         maybe_sync(device)
+        maybe_empty_cache(device)  # release training-phase cache before the heavier val pass
 
         pooled_auc, per_task, val_ce, _, _ = evaluate(
             model, processor, val_loader, device, max_val_batches=args.max_val_batches,
