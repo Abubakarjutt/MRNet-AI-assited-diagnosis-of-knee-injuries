@@ -12,12 +12,24 @@
 # effective schedule across the chain is ~constant lr with a tiny warmup each
 # epoch -- a fine regime for LoRA SFT.
 #
-# Usage:  scripts/chain_finetune.sh [ITERS] [PREFIX] [DATA_ROOT]
+# Seed: run() re-seeds to --seed at the top of every process, so a fixed seed makes
+# the shuffle=True train loader draw the SAME --max_train_batches exams every
+# iteration -- two iters resuming the same checkpoint then produce bit-identical
+# output and the chain never progresses. We pass --seed=(SEED_BASE + i) so each
+# iteration sees a genuinely different slice; ~8 iters of 400/1130 covers ~97% of
+# the training set.
+#
+# Val: evaluated on the full 120-exam val set (not the unshuffled first-90 slice,
+# which is an easier sample and inflated "best" by ~0.05), so the saved best
+# reflects the true pooled AUC.
+#
+# Usage:  scripts/chain_finetune.sh [ITERS] [PREFIX] [DATA_ROOT] [SEED_BASE]
 set -u
 
 ITERS=${1:-8}
 PREFIX=${2:-medgemma_full}
 DATA=${3:-/Users/Apple/projects/MRNet/MRNet-v1.0}
+SEED_BASE=${4:-2000}
 LOG=/tmp/${PREFIX}_chain.log
 
 echo "=== chain start $(date) | iters=$ITERS prefix=$PREFIX ===" | tee -a "$LOG"
@@ -29,12 +41,13 @@ for i in $(seq 1 "$ITERS"); do
     resume=()
     [[ -n "$latest" ]] && resume=(--resume_adapter "$latest")
 
-    echo "=== iter $i/$ITERS $(date) | resume='${latest:-<none, fresh init>}' ===" | tee -a "$LOG"
+    seed=$((SEED_BASE + i))
+    echo "=== iter $i/$ITERS $(date) | seed=$seed | resume='${latest:-<none, fresh init>}' ===" | tee -a "$LOG"
 
     python -u vlm_finetune.py \
         --prefix_name "$PREFIX" --data_root "$DATA" \
         --epochs 1 --grad_accum 8 --lr 5e-5 --lora_dropout 0.1 \
-        --max_train_batches 400 --max_val_batches 90 \
+        --seed "$seed" --max_train_batches 400 --max_val_batches 120 \
         "${resume[@]}" >> "$LOG" 2>&1
     rc=$?
     echo "=== iter $i exit rc=$rc $(date) ===" | tee -a "$LOG"
