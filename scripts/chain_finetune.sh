@@ -1,23 +1,27 @@
 #!/bin/zsh
 # Chained one-epoch MedGemma-4B LoRA fine-tune.
 #
-# This Mac cannot sustain more than ~1 epoch of MedGemma-4B training before macOS
-# memory-kills the process (exit 137). So instead of one long multi-epoch run we
-# invoke vlm_finetune.py once per epoch: each call warm-starts from the best
-# adapter on disk (--resume_adapter), trains a single epoch, evaluates, and saves
-# only if it beat that checkpoint. A kill costs <=1 epoch; the next iteration
-# resumes from whatever the last one managed to save.
+# A long multi-epoch MedGemma-4B run on this Mac gets memory-killed (exit 137)
+# once accumulated MPS cache + swap outgrows headroom. So instead we invoke
+# vlm_finetune.py once per epoch: each call warm-starts from the best adapter on
+# disk (--resume_adapter), trains a single full epoch, evaluates, and saves only
+# if it beat that checkpoint. A kill costs <=1 epoch; the next iteration resumes
+# from whatever the last one managed to save.
 #
-# LR note: each 1-epoch process restarts the cosine scheduler from step 0, so the
-# effective schedule across the chain is ~constant lr with a tiny warmup each
-# epoch -- a fine regime for LoRA SFT.
+# LR note: each 1-epoch process runs its cosine schedule from 5e-5 down to ~0 over
+# that epoch's ~142 steps, then the next iteration resets to 5e-5 -- a warm-restart
+# (SGDR-style) schedule across the chain.
+#
+# Epochs: each iteration is one FULL pass over all 1130 training exams (no
+# --max_train_batches cap). The earlier cap existed to dodge OOM kills that were
+# actually caused by a full disk (since fixed); a true full pass gives a much
+# stronger per-epoch gradient than a random 35% slice.
 #
 # Seed: run() re-seeds to --seed at the top of every process, so a fixed seed makes
-# the shuffle=True train loader draw the SAME --max_train_batches exams every
-# iteration -- two iters resuming the same checkpoint then produce bit-identical
-# output and the chain never progresses. We pass --seed=(SEED_BASE + i) so each
-# iteration sees a genuinely different slice; ~8 iters of 400/1130 covers ~97% of
-# the training set.
+# every iteration shuffle identically -- two iters resuming the same checkpoint
+# then produce bit-identical output and the chain stalls. --seed=(SEED_BASE + i)
+# gives each iteration a different shuffle order (and dropout draw) so a resumed
+# epoch is genuinely new work.
 #
 # Val: evaluated on the full 120-exam val set (not the unshuffled first-90 slice,
 # which is an easier sample and inflated "best" by ~0.05), so the saved best
@@ -47,7 +51,7 @@ for i in $(seq 1 "$ITERS"); do
     python -u vlm_finetune.py \
         --prefix_name "$PREFIX" --data_root "$DATA" \
         --epochs 1 --grad_accum 8 --lr 5e-5 --lora_dropout 0.1 \
-        --seed "$seed" --max_train_batches 400 --max_val_batches 120 \
+        --seed "$seed" --max_val_batches 120 \
         "${resume[@]}" >> "$LOG" 2>&1
     rc=$?
     echo "=== iter $i exit rc=$rc $(date) ===" | tee -a "$LOG"
