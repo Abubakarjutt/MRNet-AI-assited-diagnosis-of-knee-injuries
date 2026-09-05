@@ -27,6 +27,11 @@
 # which is an easier sample and inflated "best" by ~0.05), so the saved best
 # reflects the true pooled AUC.
 #
+# Augmentation: train-time aug is on by default (AUGMENT=1). It is applied only to
+# the training loader; the val pass stays clean/deterministic. Override per run:
+#   AUGMENT=0 scripts/chain_finetune.sh ...            # no-aug (old behaviour)
+#   AUG_POLICY=knee_mri SLICE_JITTER=1 scripts/... ..  # tune the policy
+#
 # Usage:  scripts/chain_finetune.sh [ITERS] [PREFIX] [DATA_ROOT] [SEED_BASE]
 set -u
 
@@ -34,9 +39,12 @@ ITERS=${1:-8}
 PREFIX=${2:-medgemma_full}
 DATA=${3:-/Users/Apple/projects/MRNet/MRNet-v1.0}
 SEED_BASE=${4:-2000}
+AUGMENT=${AUGMENT:-1}
+AUG_POLICY=${AUG_POLICY:-knee_mri_plus}
+SLICE_JITTER=${SLICE_JITTER:-2}
 LOG=/tmp/${PREFIX}_chain.log
 
-echo "=== chain start $(date) | iters=$ITERS prefix=$PREFIX ===" | tee -a "$LOG"
+echo "=== chain start $(date) | iters=$ITERS prefix=$PREFIX | augment=$AUGMENT policy=$AUG_POLICY jitter=$SLICE_JITTER ===" | tee -a "$LOG"
 
 for i in $(seq 1 "$ITERS"); do
     # highest-AUC adapter dir for this prefix, by the valauc_<float> tag in its name
@@ -52,6 +60,7 @@ for i in $(seq 1 "$ITERS"); do
         --prefix_name "$PREFIX" --data_root "$DATA" \
         --epochs 1 --grad_accum 8 --lr 5e-5 --lora_dropout 0.1 \
         --seed "$seed" --max_val_batches 120 \
+        --augment "$AUGMENT" --aug_policy "$AUG_POLICY" --slice_jitter "$SLICE_JITTER" \
         "${resume[@]}" >> "$LOG" 2>&1
     rc=$?
     echo "=== iter $i exit rc=$rc $(date) ===" | tee -a "$LOG"
