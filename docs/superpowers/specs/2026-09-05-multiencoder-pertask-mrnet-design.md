@@ -1,7 +1,7 @@
 # Multi-Encoder Per-Task Feature-Bank Classifier for MRNet — Design Spec
 
 **Date:** 2026-09-05
-**Status:** Draft — awaiting user review
+**Status:** Draft — §11 open questions resolved (see §11.1); awaiting user review
 **Scope:** A single-run, three-head MRNet classifier that consumes **cached features from a
 bank of 2–3 frozen pretrained encoders**, with per-task specialization (plane emphasis,
 feature level, pooling, augmentation, decision threshold) and a dedicated multi-scale head
@@ -157,10 +157,13 @@ python scripts/build_feature_cache.py \
   --data_root MRNet-v1.0 \
   --encoders medsiglip,dinov2 \
   --variants clean,hflip,rotp,rotn,slicesB,slicesC \
-  --slices_per_plane 24 --slice_strategy uniform \
+  --slices_per_plane 32 --slice_strategy uniform \
   --want_patch_for meniscus \
   --out feature_cache/
 ```
+
+Cache at 32 slices/plane (§11.1 R2); `FeatureCacheDataset` subsamples to `--slices_used`
+(default 24) at load time, so slice count is a CV knob rather than a re-cache.
 
 Idempotent: skips an `<enc>/<variant>/<split>/<exam_id>.pt` that already exists and passes a
 version/shape check. Resumable after an MPS OOM kill (per-exam granularity).
@@ -180,7 +183,8 @@ feature_cache/
 ```
 
 Each `<exam>.pt` per plane holds:
-- `pooled`: `float16` `[S, pooled_dim]` (S = `slices_per_plane`)
+- `pooled`: `float16` `[S, pooled_dim]` (S = `slices_per_plane` = 32 on disk; the dataset
+  subsamples to `slices_used` at load)
 - `patch`: `float16` `[S, patch_dim, h, w]` — **only** for planes/encoders enabled via
   `--want_patch_for` (meniscus branch uses sagittal+coronal patch grids; that is the only
   patch consumer, to keep disk sane).
@@ -205,13 +209,17 @@ averages head logits over variants (TTA).
 
 ### 4.4 Disk budget
 
-Per encoder, per variant, per split, pooled-only:
-~1,250 exams × 3 planes × 24 slices × 768–1152 dims × 2 B (fp16) ≈ **0.13–0.20 GB**.
-6 variants × 2 encoders pooled ≈ **1.6–2.4 GB**. Patch grids (meniscus only, 2 planes,
-2 encoders, 6 variants): DINOv2 16×16×768 fp16 ≈ 0.4 MB/slice → ~1,250 × 24 × 2 × 2 × 6 ×
-0.4 MB ≈ **6 GB**. **Total ≈ 8–10 GB.** Fits the current free-space envelope (§ ledger notes
-disk fluctuates 8–16 GB free). If tight: drop `rotp/rotn` patch grids, or fp8-quantize
-patch features.
+Per encoder, per variant, per split, pooled-only (at the 32-slice cache, §11.1 R2):
+~1,250 exams × 3 planes × 32 slices × 768–1152 dims × 2 B (fp16) ≈ **0.17–0.27 GB**.
+6 variants × 2 encoders pooled ≈ **2.1–3.2 GB**. Patch grids (meniscus only, 2 planes,
+2 encoders, 6 variants): DINOv2 16×16×768 fp16 ≈ 0.4 MB/slice → ~1,250 × 32 × 2 × 2 × 6 ×
+0.4 MB ≈ **8 GB**. **Total ≈ 10–12 GB.**
+
+This is tight against the current ~11 GB free (§ ledger notes disk fluctuates 8–16 GB).
+**Cache-build gate:** require ≥ 16 GB free before the patch-grid pass, or apply a fallback
+in this order: (a) patch grids for `clean` + `hflip` variants only (rot variants get
+pooled-only) → ~3 GB patch, total ~6 GB; (b) fp8-quantize patch features; (c) drop
+`rotp/rotn` entirely. Pooled-only phase 1 (C1) needs just ~1 GB and has no gate.
 
 ---
 
@@ -276,8 +284,10 @@ Returns `[B, 3]` logits in TASKS order — identical downstream contract.
   tunable. Optionally per-task `label_smoothing`.
 - **Optimizer:** AdamW, per-task-group LR allowed (heads are separate module groups).
 - **Schedule / EMA / best-ckpt:** unchanged `train.py` machinery. Selection metric =
-  **mean of the 3 val per-task AUCs** (new: `train.py` currently selects on val loss / pooled
-  AUC — add `--select_metric per_task_mean` as an opt-in, default unchanged).
+  **mean of the 3 val per-task AUCs**. `train.py` gains
+  `--select_metric {loss,pooled_auc,per_task_mean}`; the default is resolved after arg
+  parsing — `per_task_mean` when `model_type == "featbank"`, today's behaviour otherwise
+  (§11.1 R4).
 - **Model selection guardrail (critical):** the 120-val set is tiny → picking hyperparams
   by watching val AUC overfits it. Use **5-fold CV on the 1,130 train exams** for all
   hyperparameter and threshold decisions (cheap: features are cached, a fold trains in
@@ -295,9 +305,9 @@ Returns `[B, 3]` logits in TASKS order — identical downstream contract.
 | `feature_bank.py` (new) | frozen encoder wrappers (MedSigLIP patch-grid adapter, DINOv2, later BiomedCLIP); `FrozenEncoder` protocol |
 | `scripts/build_feature_cache.py` (new) | offline caching pass; idempotent, resumable; writes `manifest.json` |
 | `scripts/cv_select.py` (new) | 5-fold CV over cached features for hyperparam/threshold selection |
-| `dataloader.py` | add `FeatureCacheDataset` (reads cache, yields batch dict, shuffles variant per epoch); no change to existing classes |
+| `dataloader.py` | add `FeatureCacheDataset` (reads cache, subsamples 32→`--slices_used` slices, yields batch dict, shuffles variant per epoch); no change to existing classes |
 | `lightweight_models.py` | add `FeatBankMRNet` (+ `consumes_feature_batch = True`); reuse `GeMPooling`, `AttentionPooling`, `PlaneAttentionFusion` |
-| `train.py` | `build_model`: `elif args.model_type == "featbank": model = FeatBankMRNet(...)`; 1-line `forward` branch on `consumes_feature_batch`; new args `--encoders`, `--feature_cache`, `--cache_variants`, `--select_metric`; new opt-in `--select_metric per_task_mean` |
+| `train.py` | `build_model`: `elif args.model_type == "featbank": model = FeatBankMRNet(...)`; 1-line `forward` branch on `consumes_feature_batch`; new args `--encoders`, `--feature_cache`, `--cache_variants`, `--slices_used`, `--slices_used_meniscus`, `--d_model`, `--select_metric {loss,pooled_auc,per_task_mean}` (default resolved post-parse: `per_task_mean` iff `model_type == "featbank"`) |
 | `medical_encoders.py` | MedSigLIP wrapper gains optional `want_patch` returning the token grid (backward compatible) |
 | `MEDICAL_MODELS.md` | new "Path 3 — Multi-encoder feature bank" section: setup, cache build, train, expected numbers |
 | `tests/` | fast-suite tests (fakes, no downloads): cache format round-trip, `FeatureCacheDataset` batch shape, `FeatBankMRNet` forward shape per head, `train.py` forward-branch dispatch, CV splitter determinism. Real-encoder paths `@pytest.mark.slow`. |
@@ -358,3 +368,41 @@ Each checkpoint is one CV sweep = hours on MPS, not days.
    when `model_type == featbank`?
 5. **Is C3 worth attempting** if C2 lands at, say, meniscus 0.89 / ACL 0.96 — or do we
    declare that the result and stop?
+
+### 11.1 Resolutions (2026-09-05)
+
+Rulings adopted for the implementation plan. Each is reversible mid-project if a
+checkpoint contradicts it; the cost of a wrong call here is one extra CV sweep or one
+re-cache, both bounded.
+
+1. **Encoder roster — phased. Phase 1 = MedSigLIP-448 + DINOv2 ViT-B/14 only.**
+   BiomedCLIP is deferred to phase 2 and added only if the C2 checkpoint (§9) misses its
+   bar. Rationale: each encoder adds ~1 GB cache and a multi-hour caching pass on MPS; the
+   medical + self-supervised pair is the most complementary starting point; C2 is the
+   honest signal for whether a third view is needed. `--encoders` still accepts a
+   comma list so phase 2 is a re-run, not a code change.
+
+2. **Slice count — cache 32/plane, subsample in the dataset.** `build_feature_cache.py`
+   runs at `--slices_per_plane 32` (`uniform`). `FeatureCacheDataset` takes
+   `--slices_used` (default 24) and subsamples the cached 32 → 24 by uniform stride at
+   load time; the meniscus head may request the full 32 via `--slices_used_meniscus 32`.
+   Rationale: re-caching is the expensive, irreversible-in-practice op; over-caching by
+   33 % costs ~0.05 GB/encoder/variant (well inside §4.4) and makes slice count a free
+   CV knob instead of a recache.
+
+3. **`d_model` — default 256, swept `{192, 256, 384}` in the C1 and C2 CV.** Exposed as
+   `--d_model`. Not a blocker; the sweep rides along in the CV that runs for C1/C2 anyway.
+
+4. **Selection metric — `per_task_mean` is the default when `model_type == "featbank"`;
+   unchanged for every other model type.** `train.py` gains `--select_metric
+   {loss,pooled_auc,per_task_mean}`; its default is resolved *after* arg parsing:
+   `featbank` → `per_task_mean`, all others → today's behaviour. Rationale: Path 3's whole
+   purpose is per-task AUC vs the published per-task numbers; requiring an opt-in flag is a
+   silent-footgun where a forgotten flag invalidates a multi-hour run. Other paths see no
+   behaviour change.
+
+5. **C3 is attempted only if C2 lands within 0.02 of every C3 bar** — i.e. C2 gives
+   meniscus ≥ 0.89 **and** ACL ≥ 0.95 **and** abnormal ≥ 0.93. Otherwise C2 is declared
+   the result and the frozen-feature ceiling is documented (§9-C3 "if missed" row).
+   Rationale: bounded MPS compute; a >0.02 gap after phase 2 is a ceiling, not a
+   tuning-away distance, and chasing it indefinitely has no stopping rule.
