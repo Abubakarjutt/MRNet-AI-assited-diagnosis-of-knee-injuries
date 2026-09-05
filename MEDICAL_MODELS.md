@@ -101,6 +101,8 @@ python vlm_finetune.py --prefix_name medgemma_full --epochs 1 \
 | `--base_model` | `google/medgemma-4b-it` | HF id of the base multimodal model |
 | `--lora_r` / `--lora_alpha` / `--lora_dropout` | `16` / `32` / `0.05` | LoRA adapter hyperparameters |
 | `--slices_per_plane` / `--slice_strategy` | `6` / `uniform` | montage cells per plane and sampling strategy |
+| `--augment` / `--aug_policy` | `1` / `knee_mri_plus` | train-time study-consistent volume augmentation via `dataloader.MRVolumeAugmentor` (flip, intensity, gamma, small spatial shift); **eval is never augmented** |
+| `--slice_jitter` | `2` | per-read jitter (±N slices) on the montage slice indices — a different montage each epoch; train only, `0` disables |
 | `--patience` | `3` | early-stop patience on val AUC (`0` disables) |
 | `--eval_only` / `--dump_predictions` | — | reload a saved adapter / write the prediction TSV |
 | `--resume_adapter` | — | warm-start training from a saved LoRA adapter dir (kept trainable); `best_val_auc` is seeded from its `valauc_<f>` tag so a worse epoch can't overwrite it |
@@ -117,6 +119,11 @@ python vlm_finetune.py --prefix_name medgemma_full --epochs 1 \
    on val *loss*; here val AUC is the entire point of the run. (2) The LR schedule is
    **cosine-with-warmup** across the whole run (`get_cosine_schedule_with_warmup`), not
    `train.py`'s `ReduceLROnPlateau` — a few-hundred-step LoRA run never plateaus meaningfully.
+- Training augmentation runs on the raw volumes **before** montage assembly. Because
+   `build_montage` re-levels each frame with a per-frame min-max, global-intensity ops are
+   largely undone; the augmentations that carry signal are horizontal flip, small spatial
+   shift, gamma, and the per-epoch `--slice_jitter`. `--eval_only` and the validation pass
+   are always unaugmented and deterministic.
 - Only the LoRA adapter is saved (`model.save_pretrained`); the ~4B base reloads from the HF
    cache. One best per run: on each new best the adapter is written first, *then* prior
    `<prefix>_medgemma_lora_valauc_*` dirs are pruned (the new dir is passed as `keep=`), so a

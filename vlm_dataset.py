@@ -15,7 +15,7 @@ self-contained and testable.)
 import torch
 from torch.utils.data import Dataset
 
-from dataloader import MRMultiPlaneDataset, TASKS
+from dataloader import MRMultiPlaneDataset, MRVolumeAugmentor, TASKS
 from vlm_common import (
     build_conversation,
     build_montage,
@@ -26,29 +26,59 @@ from vlm_common import (
 
 
 class MRVLMDataset(Dataset):
+    """Wraps ``MRMultiPlaneDataset`` and turns each exam into three slice-montage images.
+
+    Training augmentation (``train=True`` and ``augment=True``, the defaults):
+      * a study-consistent ``MRVolumeAugmentor`` runs on the raw volumes before montage
+        assembly — one sampled plan applied identically to all three planes (flip,
+        intensity, and — for ``knee_mri_plus`` — gamma and small spatial shift). The
+        per-frame min-max normalisation inside ``build_montage`` re-levels global
+        intensity, so flip / spatial-shift / gamma / slice-jitter carry the signal.
+      * ``slice_jitter`` perturbs the montage slice indices per read (see
+        ``vlm_common.sample_slice_indices``), so each epoch sees a slightly different
+        montage.
+    Eval (``train=False``) is always unaugmented and deterministic regardless of
+    ``augment`` / ``slice_jitter``.
+    """
+
     def __init__(self, root_dir, train, k=6, grid=(3, 2), cell=448,
-                 slice_strategy="uniform", mmap=True, cache_size=32):
+                 slice_strategy="uniform", mmap=True, cache_size=32,
+                 augment=True, aug_policy="knee_mri_plus",
+                 aug_gamma_jitter=0.15, aug_spatial_shift_frac=0.05, slice_jitter=2):
+        self.train = bool(train)
+        self.augment = bool(augment) and self.train
+        transform = None
+        if self.augment:
+            transform = MRVolumeAugmentor(
+                policy=aug_policy,
+                gamma_jitter=aug_gamma_jitter,
+                spatial_shift_frac=aug_spatial_shift_frac,
+            )
         self.base = MRMultiPlaneDataset(
             root_dir=root_dir,
             train=train,
             mmap=mmap,
             cache_size=cache_size,
-            transform=None,            # no augmentation: montages are the only spatial op
+            transform=transform,
         )
         self.k = int(k)
         self.grid = tuple(grid)
         self.cell = int(cell)
         self.slice_strategy = slice_strategy
+        self.slice_jitter = int(slice_jitter)
 
     def __len__(self):
         return len(self.base)
 
     def __getitem__(self, i):
         volumes, label, _weights, exam_id = self.base[i]     # 3 x [s, 256, 256]
+        jitter = self.slice_jitter if (self.train and self.slice_jitter > 0) else 0
         images = [
             build_montage(
                 volume,
-                sample_slice_indices(volume.shape[0], self.k, self.slice_strategy),
+                sample_slice_indices(
+                    volume.shape[0], self.k, self.slice_strategy, jitter=jitter,
+                ),
                 self.grid,
                 self.cell,
             )

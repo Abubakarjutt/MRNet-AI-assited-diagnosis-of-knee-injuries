@@ -51,6 +51,46 @@ def test_sample_slice_indices_unknown_strategy_raises():
         vlm_common.sample_slice_indices(10, 4, "bogus")
 
 
+# --- sample_slice_indices: per-epoch jitter ---------------------------------- #
+def test_sample_slice_indices_jitter_zero_is_unchanged():
+    # jitter=0 (the default) must reproduce the pre-jitter behaviour byte-for-byte.
+    base = vlm_common.sample_slice_indices(30, 6, "uniform")
+    assert vlm_common.sample_slice_indices(30, 6, "uniform", jitter=0) == base
+
+
+def test_sample_slice_indices_jitter_keeps_the_contract():
+    n, k = 30, 6
+    idx = vlm_common.sample_slice_indices(n, k, "uniform", jitter=3, jitter_seed=1)
+    assert len(idx) == k
+    assert idx == sorted(idx)
+    assert all(0 <= i < n for i in idx)
+    assert all(isinstance(i, int) for i in idx)
+
+
+def test_sample_slice_indices_jitter_is_bounded_by_jitter():
+    n, k, j = 40, 6, 2
+    base = vlm_common.sample_slice_indices(n, k, "uniform")
+    for seed in range(20):
+        got = vlm_common.sample_slice_indices(n, k, "uniform", jitter=j, jitter_seed=seed)
+        for b, g in zip(base, got):
+            # each index moves at most `j` before clipping to [0, n-1]
+            assert abs(g - b) <= j or g in (0, n - 1)
+
+
+def test_sample_slice_indices_jitter_seed_is_reproducible():
+    a = vlm_common.sample_slice_indices(30, 6, "uniform", jitter=3, jitter_seed=7)
+    b = vlm_common.sample_slice_indices(30, 6, "uniform", jitter=3, jitter_seed=7)
+    assert a == b
+
+
+def test_sample_slice_indices_jitter_varies_across_seeds():
+    outs = {
+        tuple(vlm_common.sample_slice_indices(40, 6, "uniform", jitter=3, jitter_seed=s))
+        for s in range(30)
+    }
+    assert len(outs) > 1          # different draws -> different montage slice sets
+
+
 # --- compute_auc (verbatim copy of train.py:144-150) --------------------------- #
 def test_compute_auc_matches_sklearn_on_mixed():
     y_true = [0, 1, 0, 1, 1, 0]

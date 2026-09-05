@@ -70,3 +70,45 @@ def test_collate_requires_single_batch(mrnet_fixture, fake_processor):
     item = _item(mrnet_fixture, fake_processor)
     with pytest.raises(ValueError):
         vlm_dataset.collate_fn([item, item], fake_processor, train=True)
+
+
+# --- training-time augmentation ------------------------------------------------ #
+def test_train_dataset_attaches_a_study_consistent_augmentor(mrnet_fixture):
+    from dataloader import MRVolumeAugmentor
+
+    ds = vlm_dataset.MRVLMDataset(mrnet_fixture, train=True, k=6, cell=32)
+    assert isinstance(ds.base.transform, MRVolumeAugmentor)
+    assert hasattr(ds.base.transform, "sample_plan")   # base applies one plan across planes
+
+
+def test_augment_flag_off_disables_the_transform(mrnet_fixture):
+    ds = vlm_dataset.MRVLMDataset(mrnet_fixture, train=True, k=6, cell=32, augment=False)
+    assert ds.base.transform is None
+
+
+def test_eval_dataset_never_augments_even_with_augment_true(mrnet_fixture):
+    ds = vlm_dataset.MRVLMDataset(mrnet_fixture, train=False, k=6, cell=32, augment=True)
+    assert ds.base.transform is None
+
+
+def test_eval_dataset_is_deterministic(mrnet_fixture):
+    ds = vlm_dataset.MRVLMDataset(mrnet_fixture, train=False, k=6, cell=32)
+    a = ds[0]["images"][0].tobytes()
+    b = ds[0]["images"][0].tobytes()
+    assert a == b                                       # no aug, no slice jitter
+
+
+def test_train_dataset_montage_varies_between_reads(mrnet_fixture):
+    # slice jitter + spatial/flip aug => two reads of the same exam differ
+    ds = vlm_dataset.MRVLMDataset(
+        mrnet_fixture, train=True, k=6, cell=32, slice_jitter=3, aug_policy="knee_mri_plus"
+    )
+    reads = {ds[0]["images"][0].tobytes() for _ in range(8)}
+    assert len(reads) > 1
+
+
+def test_train_dataset_output_shape_and_mode_unchanged(mrnet_fixture):
+    ds = vlm_dataset.MRVLMDataset(mrnet_fixture, train=True, k=6, grid=(3, 2), cell=32)
+    for img in ds[0]["images"]:
+        assert img.size == (32 * 2, 32 * 3)
+        assert img.mode == "RGB"

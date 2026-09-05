@@ -53,8 +53,17 @@ def compute_auc(y_true, y_pred):
 #       duplicate; documented, not an error).                                   #
 # This is a *user contribution* (spec §11). The bodies below are the documented  #
 # DEFAULT; they are overridable.                                                #
+#                                                                              #
+# `jitter` (train-time only): after the base indices are chosen, perturb each   #
+# by an integer in [-jitter, jitter] and re-clip/sort. This gives a slightly     #
+# different montage every epoch — the cheapest, highest-value augmentation for a  #
+# frozen vision tower (it stops the LoRA head memorising one fixed slice set).   #
+# `jitter_seed=None` draws fresh entropy per call (real training); pass an int   #
+# for a reproducible draw (tests). `jitter=0` reproduces the pre-jitter output   #
+# byte-for-byte and constructs no RNG.                                           #
 # --------------------------------------------------------------------------- #
-def sample_slice_indices(num_slices, k, strategy="uniform", seed=_CENTER_SEED):
+def sample_slice_indices(num_slices, k, strategy="uniform", seed=_CENTER_SEED,
+                         jitter=0, jitter_seed=None):
     n = int(num_slices)
     k = int(k)
     if n <= 0:
@@ -64,21 +73,23 @@ def sample_slice_indices(num_slices, k, strategy="uniform", seed=_CENTER_SEED):
 
     if n < k:
         # Not enough slices: repeat via linspace; montage cells simply duplicate.
-        return sorted(int(v) for v in np.linspace(0, n - 1, k).round())
-
-    if strategy == "uniform":
-        idx = np.linspace(0, n - 1, k).round()
-        return sorted(int(v) for v in idx)
-
-    if strategy == "center":
+        base = np.linspace(0, n - 1, k).round()
+    elif strategy == "uniform":
+        base = np.linspace(0, n - 1, k).round()
+    elif strategy == "center":
         mu = (n - 1) / 2.0
         sigma = max(n / 6.0, 1e-6)
         rng = np.random.default_rng(seed)
-        idx = rng.normal(loc=mu, scale=sigma, size=k)
-        idx = np.clip(idx.round(), 0, n - 1).astype(int)
-        return sorted(int(v) for v in idx)
+        base = np.clip(rng.normal(loc=mu, scale=sigma, size=k).round(), 0, n - 1)
+    else:
+        raise ValueError(f"unknown slice strategy: {strategy!r}")
 
-    raise ValueError(f"unknown slice strategy: {strategy!r}")
+    if jitter and int(jitter) > 0:
+        j = int(jitter)
+        offsets = np.random.default_rng(jitter_seed).integers(-j, j + 1, size=len(base))
+        base = np.clip(base + offsets, 0, n - 1)
+
+    return sorted(int(v) for v in base)
 
 
 # --------------------------------------------------------------------------- #

@@ -140,6 +140,8 @@ def build_loaders(args):
             args.data_root, train=train, k=args.slices_per_plane,
             grid=(3, 2), cell=448, slice_strategy=args.slice_strategy,
             mmap=bool(args.mmap), cache_size=args.cache_size,
+            augment=bool(args.augment), aug_policy=args.aug_policy,
+            slice_jitter=args.slice_jitter,
         )
         collate = partial(collate_fn, processor=processor_ref["processor"], train=train)
         return torch.utils.data.DataLoader(
@@ -458,6 +460,12 @@ def parse_arguments(argv=None):
     parser.add_argument("--slices_per_plane", type=int, default=6)
     parser.add_argument("--slice_strategy", type=str, default="uniform",
                         choices=["uniform", "center"])
+    parser.add_argument("--augment", type=int, default=1, choices=[0, 1],
+                        help="train-time study-consistent volume augmentation (eval is never augmented)")
+    parser.add_argument("--aug_policy", type=str, default="knee_mri_plus",
+                        choices=["none", "light", "strong", "knee_mri", "knee_mri_plus", "knee_mri_research"])
+    parser.add_argument("--slice_jitter", type=int, default=2,
+                        help="per-read montage slice-index jitter (train only; 0 disables)")
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--time_budget_minutes", type=float, default=None)
