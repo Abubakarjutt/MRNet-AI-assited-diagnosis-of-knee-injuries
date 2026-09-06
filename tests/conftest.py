@@ -201,3 +201,17 @@ def fake_processor():
 @pytest.fixture
 def fake_model():
     return _FakeModel(device="cpu")
+
+
+@pytest.fixture
+def feature_cache_fixture(mrnet_fixture, tmp_path_factory):
+    from scripts import build_feature_cache as bfc
+    out = tmp_path_factory.mktemp("feature_cache")
+    bfc.build_cache(
+        data_root=str(mrnet_fixture), out_dir=str(out),
+        encoders=["fake"], variants=["clean", "hflip", "slicesB"],
+        splits=["train", "valid"], slices_per_plane=8,
+        want_patch_for=["meniscus"], device="cpu",
+        allow_low_disk=True,
+    )
+    return out
