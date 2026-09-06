@@ -273,3 +273,148 @@ class FastMRNet(nn.Module):
             fused = torch.cat(plane_features, dim=1)
         fused = self.fusion_gate(fused)
         return self.classifier(fused)
+
+
+class _PlaneFuse(nn.Module):
+    """PlaneAttentionFusion (returns [B, n_planes*d]) followed by a projection back
+    to [B, d] so head shapes match the spec's sketches."""
+
+    def __init__(self, d_model, n_planes):
+        super().__init__()
+        self.fuse = PlaneAttentionFusion(d_model)
+        self.proj = nn.Linear(d_model * n_planes, d_model)
+
+    def forward(self, plane_feats):                       # list of [B, d]
+        return self.proj(self.fuse(plane_feats))
+
+
+class _PooledVec(nn.Module):
+    """GeM slice-pool per (enc,plane) -> mean over encoders -> plane fusion -> [B, d_model]. No classifier."""
+
+    def __init__(self, encoders, planes, d_model):
+        super().__init__()
+        self.encoders = list(encoders)
+        self.planes = list(planes)
+        self.pool = nn.ModuleDict({e: GeMPool1D() for e in self.encoders})
+        self.fuse = _PlaneFuse(d_model, len(self.planes))
+
+    def forward(self, projected):                         # projected[enc][plane] = [B,S,d]
+        plane_feats = []
+        for plane in self.planes:
+            per_enc = [self.pool[e](projected[e][plane]) for e in self.encoders]  # [B,d] each
+            plane_feats.append(torch.stack(per_enc, dim=0).mean(dim=0))
+        return self.fuse(plane_feats)                     # [B, d_model]
+
+
+class _PooledHead(nn.Module):
+    """_PooledVec + MLP -> [B] logit."""
+
+    def __init__(self, encoders, planes, d_model, head_hidden, dropout):
+        super().__init__()
+        self.vec = _PooledVec(encoders, planes, d_model)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_model), nn.Dropout(dropout),
+            nn.Linear(d_model, head_hidden), nn.GELU(),
+            nn.Linear(head_hidden, 1),
+        )
+
+    def forward(self, projected):
+        return self.mlp(self.vec(projected)).squeeze(-1)  # [B]
+
+
+class _PyramidPath(nn.Module):
+    """Per-slice depthwise-separable conv at strides {1,2} -> GAP -> concat ->
+    Linear(d_model) -> attention slice-pool -> mean over enc -> plane fusion."""
+
+    def __init__(self, patch_dims, planes, d_model):
+        super().__init__()
+        self.encoders = list(patch_dims)
+        self.planes = list(planes)
+        self.blocks = nn.ModuleDict()
+        for e, dp in patch_dims.items():
+            self.blocks[e] = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(dp, dp, 3, stride=s, padding=1, groups=dp),
+                    nn.Conv2d(dp, d_model, 1), nn.GELU(),
+                    nn.AdaptiveAvgPool2d(1),
+                ) for s in (1, 2)
+            ])
+        self.merge = nn.ModuleDict({e: nn.Linear(2 * d_model, d_model) for e in self.encoders})
+        self.slice_pool = nn.ModuleDict({e: AttentionMILPool(d_model) for e in self.encoders})
+        self.fuse = _PlaneFuse(d_model, len(self.planes))
+
+    def forward(self, patch):                             # patch[enc][plane] = [B,Sm,Dp,h,w]
+        plane_feats = []
+        for plane in self.planes:
+            per_enc = []
+            for e in self.encoders:
+                x = patch[e][plane]
+                b, sm, dp, h, w = x.shape
+                x = x.reshape(b * sm, dp, h, w)
+                scales = [blk(x).flatten(1) for blk in self.blocks[e]]      # [b*sm, d_model] each
+                slc = self.merge[e](torch.cat(scales, dim=1)).reshape(b, sm, -1)
+                per_enc.append(self.slice_pool[e](slc))                     # [B,d]
+            plane_feats.append(torch.stack(per_enc, dim=0).mean(dim=0))
+        return self.fuse(plane_feats)                                       # [B,d]
+
+
+class FeatBankMRNet(nn.Module):
+    consumes_feature_batch = True
+
+    _HEAD_PLANES = {
+        "abnormal": ("sagittal", "coronal", "axial"),
+        "acl": ("sagittal", "coronal"),
+        "meniscus": ("sagittal", "coronal"),
+    }
+
+    def __init__(self, encoder_dims, patch_dims, *, d_model=256, dropout=0.15,
+                 head_hidden=128, want_patch_encoders=None):
+        super().__init__()
+        self.encoders = list(encoder_dims)
+        self.d_model = int(d_model)
+        if want_patch_encoders is None:
+            want_patch_encoders = tuple(patch_dims)
+        self.patch_encoders = list(want_patch_encoders)
+
+        self.proj = nn.ModuleDict({
+            f"{e}::{p}": nn.Sequential(
+                nn.LayerNorm(encoder_dims[e]), nn.Linear(encoder_dims[e], d_model), nn.GELU())
+            for e in self.encoders for p in ("sagittal", "coronal", "axial")
+        })
+        self.abnormal_head = _PooledHead(self.encoders, self._HEAD_PLANES["abnormal"],
+                                         d_model, head_hidden, dropout)
+        self.acl_head = _PooledHead(self.encoders, self._HEAD_PLANES["acl"],
+                                    d_model, head_hidden, dropout)
+        self.meniscus_pyramid = None
+        if self.patch_encoders:
+            self.meniscus_vec = _PooledVec(self.encoders, self._HEAD_PLANES["meniscus"], d_model)
+            self.meniscus_pyramid = _PyramidPath(
+                {e: patch_dims[e] for e in self.patch_encoders},
+                self._HEAD_PLANES["meniscus"], d_model)
+            self.meniscus_mlp = nn.Sequential(
+                nn.LayerNorm(2 * d_model), nn.Dropout(dropout),
+                nn.Linear(2 * d_model, head_hidden), nn.GELU(),
+                nn.Linear(head_hidden, 1),
+            )
+        else:
+            self.meniscus_head = _PooledHead(self.encoders, self._HEAD_PLANES["meniscus"],
+                                             d_model, head_hidden, dropout)
+
+    def _project(self, pooled):
+        return {e: {p: self.proj[f"{e}::{p}"](pooled[e][p])
+                    for p in ("sagittal", "coronal", "axial")}
+                for e in self.encoders}
+
+    def forward(self, payload):
+        projected = self._project(payload["pooled"])
+        abnormal = self.abnormal_head(projected)
+        acl = self.acl_head(projected)
+
+        if self.meniscus_pyramid is not None:
+            pooled_vec = self.meniscus_vec(projected)              # [B,d]
+            pyr_vec = self.meniscus_pyramid(payload["patch"])      # [B,d]
+            meniscus = self.meniscus_mlp(torch.cat([pooled_vec, pyr_vec], dim=1)).squeeze(-1)
+        else:
+            meniscus = self.meniscus_head(projected)
+
+        return torch.stack([abnormal, acl, meniscus], dim=1)     # [B,3] TASKS order
