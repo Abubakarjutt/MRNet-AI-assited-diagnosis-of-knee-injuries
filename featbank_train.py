@@ -161,10 +161,11 @@ def run_featbank(args):
                     "pooled_auc": pooled_auc, "best_epoch": epoch + 1}
             bad_epochs = 0
             if _g(args, "save_model", 0):
+                prefix = _g(args, "prefix_name", "featbank")
                 os.makedirs(model_dir, exist_ok=True)
-                fname = f"model_{args.prefix_name}_featbank_ptmean_{per_task_mean:.4f}_epoch_{epoch + 1}.pth"
+                fname = f"model_{prefix}_featbank_ptmean_{per_task_mean:.4f}_epoch_{epoch + 1}.pth"
                 for existing in os.listdir(model_dir):
-                    if args.prefix_name in existing:
+                    if prefix in existing:
                         os.remove(os.path.join(model_dir, existing))
                 torch.save(model.state_dict(), os.path.join(model_dir, fname))
         else:
