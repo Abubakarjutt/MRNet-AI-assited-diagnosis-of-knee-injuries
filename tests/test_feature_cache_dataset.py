@@ -52,3 +52,25 @@ def test_slices_used_over_cap_raises(feature_cache_fixture, mrnet_fixture):
     with pytest.raises(AssertionError):
         FeatureCacheDataset(str(feature_cache_fixture), "train", encoders=["fake"],
                             variants=["clean"], data_root=str(mrnet_fixture), slices_used=999)
+
+
+def test_unknown_encoder_raises_value_error(feature_cache_fixture, mrnet_fixture):
+    import pytest
+    with pytest.raises(ValueError):
+        FeatureCacheDataset(str(feature_cache_fixture), "train", encoders=["nope"],
+                            variants=["clean"], data_root=str(mrnet_fixture),
+                            slices_used=4, slices_used_meniscus=6)
+
+
+def test_unknown_variant_raises_value_error(feature_cache_fixture, mrnet_fixture):
+    import pytest
+    with pytest.raises(ValueError):
+        FeatureCacheDataset(str(feature_cache_fixture), "train", encoders=["fake"],
+                            variants=["rotp"], data_root=str(mrnet_fixture),
+                            slices_used=4, slices_used_meniscus=6)
+
+
+def test_subsample_refuses_to_upsample():
+    import pytest
+    with pytest.raises(ValueError):
+        FeatureCacheDataset._subsample(torch.zeros(3, 2), 5)

@@ -40,3 +40,14 @@ def test_works_without_patch_when_no_patch_encoders():
     p = _payload(encs=("e1",), dims=(16,))
     p["patch"] = {}
     assert m(p).shape == (2, 3)
+
+
+def test_empty_want_patch_list_disables_pyramid_and_forward_ignores_patch():
+    m = FeatBankMRNet({"e1": 16, "e2": 24}, {"e1": 8, "e2": 8}, d_model=16,
+                      want_patch_encoders=[])
+    assert m.meniscus_pyramid is None
+    p = _payload(dims=(16, 24))
+    p["patch"] = {}
+    out = m(p)
+    assert out.shape == (2, 3)
+    assert torch.isfinite(out).all()

@@ -44,6 +44,18 @@ def test_build_cache_is_idempotent(mrnet_fixture, tmp_path):
     assert os.path.getmtime(p) == mtime
 
 
+def test_build_cache_rejects_shape_incompatible_rebuild(mrnet_fixture, tmp_path):
+    out = tmp_path / "fc"
+    kw = dict(data_root=str(mrnet_fixture), out_dir=str(out), encoders=["fake"],
+              variants=["clean"], splits=["train"], want_patch_for=[],
+              device="cpu", allow_low_disk=True)
+    bfc.build_cache(slices_per_plane=8, **kw)
+    with pytest.raises(RuntimeError):
+        bfc.build_cache(slices_per_plane=6, **kw)
+    bfc.build_cache(slices_per_plane=8, **kw)                    # same shape -> ok
+    bfc.build_cache(slices_per_plane=6, force=True, **kw)        # force -> ok
+
+
 def test_build_cache_low_disk_gate(monkeypatch, mrnet_fixture, tmp_path):
     import shutil
     monkeypatch.setattr(shutil, "disk_usage",

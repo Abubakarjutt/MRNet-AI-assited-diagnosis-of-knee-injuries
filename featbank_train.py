@@ -13,7 +13,7 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
 import utils
-from dataloader import FeatureCacheDataset, featbank_collate, TASKS
+from dataloader import FeatureCacheDataset, featbank_collate
 from lightweight_models import FeatBankMRNet
 from train import ModelEMA, compute_auc, compute_loss
 
@@ -44,6 +44,13 @@ def _select_value(metric, val_loss, pooled_auc, per_task_mean):
 
 
 def run_featbank(args):
+    seed = _g(args, "seed", 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    for _n, _d in (("loss_type", "focal"), ("focal_gamma", 2.0), ("label_smoothing", 0.0)):
+        if not hasattr(args, _n):
+            setattr(args, _n, _d)
+
     device = utils.get_device()
     variants = _g(args, "cache_variants", "clean").split(",")
     encoders = _g(args, "encoders", "fake").split(",")
@@ -81,12 +88,17 @@ def run_featbank(args):
         weights = full.weights
 
     bs = _g(args, "featbank_batch_size", 16)
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, collate_fn=featbank_collate)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
+                              collate_fn=featbank_collate, generator=g)
     val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, collate_fn=featbank_collate)
 
+    want_patch_encoders = list(full.patch_dims) if full.has_patch else []
     model = FeatBankMRNet(full.encoder_dims, full.patch_dims,
                           d_model=_g(args, "d_model", 256),
-                          dropout=_g(args, "dropout", 0.15)).to(device)
+                          dropout=_g(args, "dropout", 0.15),
+                          want_patch_encoders=want_patch_encoders).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=_g(args, "lr", 3e-4),
                                   weight_decay=_g(args, "weight_decay", 1e-4))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.3)

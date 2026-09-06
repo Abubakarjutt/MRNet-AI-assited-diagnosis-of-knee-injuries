@@ -215,3 +215,16 @@ def feature_cache_fixture(mrnet_fixture, tmp_path_factory):
         allow_low_disk=True,
     )
     return out
+
+
+@pytest.fixture
+def feature_cache_pooled_only_fixture(mrnet_fixture, tmp_path_factory):
+    from scripts import build_feature_cache as bfc
+    out = tmp_path_factory.mktemp("feature_cache_pooled")
+    bfc.build_cache(
+        data_root=str(mrnet_fixture), out_dir=str(out),
+        encoders=["fake"], variants=["clean", "hflip"],
+        splits=["train", "valid"], slices_per_plane=8,
+        want_patch_for=[], device="cpu", allow_low_disk=True,
+    )
+    return out

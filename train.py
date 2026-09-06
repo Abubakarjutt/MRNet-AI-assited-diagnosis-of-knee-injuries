@@ -699,6 +699,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--slices_used", type=int, default=24)
     parser.add_argument("--slices_used_meniscus", type=int, default=32)
     parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--featbank_batch_size", type=int, default=16)
     parser.add_argument("--eval_tta_variants", type=str, default="clean")
     parser.add_argument("--cv_folds", type=int, default=0)

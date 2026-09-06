@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import feature_cache_io as fcio                      # noqa: E402
-from dataloader import PLANES, TASKS, MRMultiPlaneDataset   # noqa: E402
+from dataloader import PLANES, MRMultiPlaneDataset   # noqa: E402
 from feature_bank import build_encoder               # noqa: E402
 
 MIN_FREE_BYTES_FOR_PATCH = 16 * (1024 ** 3)
@@ -81,6 +81,16 @@ def build_cache(*, data_root, out_dir, encoders, variants, splits,
                 "free disk or pass allow_low_disk=True (spec §4.4)."
             )
 
+    existing = fcio.read_manifest(out_dir)
+    if existing and not force:
+        if (existing.get("schema_version") != fcio.SCHEMA_VERSION
+                or existing.get("slices_per_plane") != slices_per_plane
+                or existing.get("slice_strategy") != slice_strategy):
+            raise RuntimeError(
+                "existing cache manifest is shape-incompatible with this build "
+                f"(schema/slices_per_plane/slice_strategy differ): {out_dir}. "
+                "Pass force=True to rebuild.")
+
     built_encoders = {}
     for enc_name in encoders:
         enc = build_encoder(enc_name, chunk_size=chunk_size,
@@ -143,7 +153,7 @@ def main(argv=None):
     build_cache(
         data_root=a.data_root, out_dir=a.out_dir,
         encoders=a.encoders.split(","), variants=a.variants.split(","),
-        splits=[s.replace("valid", "valid") for s in a.splits.split(",")],
+        splits=a.splits.split(","),
         slices_per_plane=a.slices_per_plane, slice_strategy=a.slice_strategy,
         want_patch_for=[x for x in a.want_patch_for.split(",") if x],
         chunk_size=a.chunk_size, device=a.device, force=a.force,

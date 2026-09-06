@@ -10,7 +10,6 @@ def test_run_dispatches_to_run_featbank(monkeypatch):
 
 
 def test_parser_has_featbank_choice_and_args():
-    parser = train.build_arg_parser() if hasattr(train, "build_arg_parser") else None
     args = train.parse_args([
         "--prefix_name", "x", "--model_type", "featbank",
         "--feature_cache", "/tmp/fc",
@@ -19,6 +18,7 @@ def test_parser_has_featbank_choice_and_args():
     assert args.feature_cache == "/tmp/fc"
     assert args.encoders == "medsiglip,dinov2"
     assert args.slices_used == 24 and args.d_model == 256
+    assert args.seed == 0
 
 
 def test_select_metric_defaults_by_model_type():

@@ -43,3 +43,9 @@ def test_run_featbank_cv_fold_runs(feature_cache_fixture, mrnet_fixture):
 def test_select_metric_loss_is_accepted(feature_cache_fixture, mrnet_fixture):
     out = ft.run_featbank(_args(feature_cache_fixture, mrnet_fixture, select_metric="loss"))
     assert out["best_epoch"] >= 1
+
+
+def test_run_featbank_pooled_only_cache_no_keyerror(feature_cache_pooled_only_fixture, mrnet_fixture):
+    out = ft.run_featbank(_args(feature_cache_pooled_only_fixture, mrnet_fixture))
+    assert set(out) == {"per_task_auc", "per_task_mean", "pooled_auc", "best_epoch"}
+    assert len(out["per_task_auc"]) == 3

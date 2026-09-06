@@ -1,4 +1,5 @@
 import math
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -359,9 +360,7 @@ class _PyramidPath(nn.Module):
 
 
 class FeatBankMRNet(nn.Module):
-    consumes_feature_batch = True
-
-    _HEAD_PLANES = {
+    _HEAD_PLANES: ClassVar[dict] = {
         "abnormal": ("sagittal", "coronal", "axial"),
         "acl": ("sagittal", "coronal"),
         "meniscus": ("sagittal", "coronal"),

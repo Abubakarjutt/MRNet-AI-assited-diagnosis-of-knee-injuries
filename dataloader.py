@@ -401,9 +401,18 @@ class FeatureCacheDataset(data.Dataset):
         self.want_patch_for = set(want_patch_for)
 
         manifest = fcio.read_manifest(cache_dir)
+        self.has_patch = "meniscus" in set(manifest.get("want_patch_for", []))
         cap = manifest.get("slices_per_plane", self.slices_used)
+        if not self._fcio.manifest_compatible(manifest, encoders=self.encoders,
+                                              variants=self.variants, slices_per_plane=cap):
+            raise ValueError(
+                f"feature cache {cache_dir!r} incompatible with request "
+                f"encoders={self.encoders} variants={self.variants} "
+                f"(manifest schema_version={manifest.get('schema_version')}, "
+                f"has encoders={sorted(manifest.get('encoders', {}))}, "
+                f"variants={sorted(manifest.get('variants', []))})")
         assert self.slices_used <= cap, f"slices_used {self.slices_used} > cached {cap}"
-        assert self.slices_used_meniscus <= cap
+        assert self.slices_used_meniscus <= cap, f"slices_used_meniscus {self.slices_used_meniscus} > cached {cap}"
         self.encoder_dims = {e: manifest["encoders"][e]["pooled_dim"] for e in self.encoders}
         self.patch_dims = {e: manifest["encoders"][e]["patch_dim"] for e in self.encoders}
 
@@ -431,6 +440,8 @@ class FeatureCacheDataset(data.Dataset):
         s = t.shape[0]
         if s == k:
             return t
+        if s < k:
+            raise ValueError(f"_subsample cannot upsample {s} -> {k}")
         idx = torch.linspace(0, s - 1, k).round().long()
         return t.index_select(0, idx)
 
@@ -442,7 +453,7 @@ class FeatureCacheDataset(data.Dataset):
             path = self._fcio.exam_cache_path(self.cache_dir, enc, variant, self.split, exam_id)
             exam = self._fcio.load_exam(path)
             pooled[enc] = {p: self._subsample(exam[p]["pooled"], self.slices_used) for p in PLANES}
-            if enc in self.want_patch_for or "meniscus" in self.want_patch_for:
+            if self.has_patch:
                 pe = {}
                 for p in self._meniscus_planes:
                     if "patch" in exam[p]:
