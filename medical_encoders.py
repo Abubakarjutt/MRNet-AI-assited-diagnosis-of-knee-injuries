@@ -48,10 +48,11 @@ class MedSigLIPEncoder(nn.Module):
         return self
 
     @torch.no_grad()
-    def forward(self, flat_inputs):
+    def forward(self, flat_inputs, want_patch=False):
         flat_inputs = flat_inputs.to(dtype=torch.float32)
         step = self.chunk_size if self.chunk_size > 0 else flat_inputs.shape[0]
         pooled_chunks = []
+        patch_chunks = []
         for start in range(0, flat_inputs.shape[0], step):
             chunk = flat_inputs[start:start + step]
             output = self.tower(pixel_values=chunk)
@@ -64,7 +65,15 @@ class MedSigLIPEncoder(nn.Module):
                     )
                 pooled = self._image_features_fallback(pixel_values=chunk)
             pooled_chunks.append(pooled.float())
-        return torch.cat(pooled_chunks, dim=0)
+            if want_patch:
+                tokens = output.last_hidden_state.float()          # [c, 1024, 1152]
+                c, t, d = tokens.shape
+                side = int(round(t ** 0.5))
+                patch_chunks.append(tokens.transpose(1, 2).reshape(c, d, side, side))
+        pooled_out = torch.cat(pooled_chunks, dim=0)
+        if not want_patch:
+            return pooled_out
+        return {"pooled": pooled_out, "patch": torch.cat(patch_chunks, dim=0)}
 
     def state_dict(self, *args, **kwargs):
         destination = kwargs.get("destination")

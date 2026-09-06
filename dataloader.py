@@ -376,3 +376,107 @@ class MRMultiPlaneDataset(data.Dataset):
                 volumes = tuple(self.transform(volume) for volume in volumes)
         label = torch.from_numpy(self.labels[index])
         return volumes, label, self.weights, self.exam_ids[index]
+
+
+class FeatureCacheDataset(data.Dataset):
+    """Streams cached frozen-encoder features (spec §5.1). Yields a 4-tuple shaped
+    like MRMultiPlaneDataset so downstream unpack `(x, label, _, _)` still works;
+    here `x` is a nested payload dict, not volume tensors."""
+
+    def __init__(self, cache_dir, split, encoders, variants, *, data_root=None,
+                 slices_used=24, slices_used_meniscus=32, want_patch_for=("meniscus",),
+                 train=True, seed=0):
+        super().__init__()
+        import feature_cache_io as fcio
+        self._fcio = fcio
+        self.cache_dir = cache_dir
+        self.split = split
+        self.encoders = list(encoders)
+        self.variants = list(variants)
+        self.train = bool(train)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.slices_used = int(slices_used)
+        self.slices_used_meniscus = int(slices_used_meniscus)
+        self.want_patch_for = set(want_patch_for)
+
+        manifest = fcio.read_manifest(cache_dir)
+        self.has_patch = "meniscus" in set(manifest.get("want_patch_for", []))
+        cap = manifest.get("slices_per_plane", self.slices_used)
+        if not self._fcio.manifest_compatible(manifest, encoders=self.encoders,
+                                              variants=self.variants, slices_per_plane=cap):
+            raise ValueError(
+                f"feature cache {cache_dir!r} incompatible with request "
+                f"encoders={self.encoders} variants={self.variants} "
+                f"(manifest schema_version={manifest.get('schema_version')}, "
+                f"has encoders={sorted(manifest.get('encoders', {}))}, "
+                f"variants={sorted(manifest.get('variants', []))})")
+        assert self.slices_used <= cap, f"slices_used {self.slices_used} > cached {cap}"
+        assert self.slices_used_meniscus <= cap, f"slices_used_meniscus {self.slices_used_meniscus} > cached {cap}"
+        self.encoder_dims = {e: manifest["encoders"][e]["pooled_dim"] for e in self.encoders}
+        self.patch_dims = {e: manifest["encoders"][e]["patch_dim"] for e in self.encoders}
+
+        root = resolve_dataset_root(data_root)
+        records = _read_split_records(root, split)
+        self.exam_ids = records["id"].tolist()
+        self.labels = records[list(TASKS)].to_numpy(dtype=np.float32)
+        self.weights = _compute_class_weights(self.labels)
+        self._meniscus_planes = ("sagittal", "coronal")
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return len(self.exam_ids)
+
+    def _variant_for(self, i):
+        if not self.train:
+            return self.variants[0]
+        rng = np.random.default_rng((self.seed, self.epoch, i))
+        return self.variants[int(rng.integers(0, len(self.variants)))]
+
+    @staticmethod
+    def _subsample(t, k):
+        s = t.shape[0]
+        if s == k:
+            return t
+        if s < k:
+            raise ValueError(f"_subsample cannot upsample {s} -> {k}")
+        idx = torch.linspace(0, s - 1, k).round().long()
+        return t.index_select(0, idx)
+
+    def __getitem__(self, i):
+        exam_id = self.exam_ids[i]
+        variant = self._variant_for(i)
+        pooled, patch = {}, {}
+        for enc in self.encoders:
+            path = self._fcio.exam_cache_path(self.cache_dir, enc, variant, self.split, exam_id)
+            exam = self._fcio.load_exam(path)
+            pooled[enc] = {p: self._subsample(exam[p]["pooled"], self.slices_used) for p in PLANES}
+            if self.has_patch:
+                pe = {}
+                for p in self._meniscus_planes:
+                    if "patch" in exam[p]:
+                        pe[p] = self._subsample(exam[p]["patch"], self.slices_used_meniscus)
+                if pe:
+                    patch[enc] = pe
+        payload = {"pooled": pooled, "patch": patch}
+        label = torch.from_numpy(self.labels[i])
+        return payload, label, self.weights, exam_id
+
+
+def featbank_collate(items):
+    payloads = [it[0] for it in items]
+    labels = torch.stack([it[1] for it in items], dim=0)
+    weights = items[0][2]
+    exam_ids = [it[3] for it in items]
+
+    def _stack(key):
+        out = {}
+        for enc in payloads[0][key]:
+            out[enc] = {}
+            for plane in payloads[0][key][enc]:
+                out[enc][plane] = torch.stack([p[key][enc][plane] for p in payloads], dim=0)
+        return out
+
+    return {"pooled": _stack("pooled"), "patch": _stack("patch")}, labels, weights, exam_ids

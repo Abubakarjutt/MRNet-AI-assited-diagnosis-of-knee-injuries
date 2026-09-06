@@ -364,6 +364,9 @@ def model_complexity_score(args):
 
 
 def build_model(args):
+    if args.model_type == "featbank":
+        raise RuntimeError("featbank models are built inside featbank_train.run_featbank, "
+                           "not build_model; run() dispatches before reaching here.")
     if args.model_type == "advanced":
         model = advanced_vit.AdvancedMRNetViT(
             num_classes=3,
@@ -459,6 +462,9 @@ def maybe_load_init_checkpoint(model, checkpoint_path):
 
 
 def run(args):
+    if getattr(args, "model_type", "") == "featbank":
+        from featbank_train import run_featbank
+        return run_featbank(args)
     if args.batch_size != 1:
         raise ValueError("MRNet training currently expects --batch_size 1 because slice counts vary by exam.")
 
@@ -640,7 +646,7 @@ def run(args):
     print(f"device:             {device.type}")
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-t",
@@ -686,6 +692,20 @@ def parse_arguments():
         help="How to combine sagittal, coronal, and axial features before classification.",
     )
     parser.add_argument("--plane_transformer_heads", type=int, default=4)
+    parser.add_argument("--feature_cache", type=str, default="")
+    parser.add_argument("--encoders", type=str, default="medsiglip,dinov2")
+    parser.add_argument("--cache_variants", type=str,
+                        default="clean,hflip,rotp,rotn,slicesB,slicesC")
+    parser.add_argument("--slices_used", type=int, default=24)
+    parser.add_argument("--slices_used_meniscus", type=int, default=32)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--featbank_batch_size", type=int, default=16)
+    parser.add_argument("--eval_tta_variants", type=str, default="clean")
+    parser.add_argument("--cv_folds", type=int, default=0)
+    parser.add_argument("--cv_fold", type=int, default=-1)
+    parser.add_argument("--select_metric", type=str, default=None,
+                        choices=["loss", "pooled_auc", "per_task_mean"])
     parser.add_argument("--flush_history", type=int, choices=[0, 1], default=0)
     parser.add_argument("--save_model", type=int, choices=[0, 1], default=1)
     parser.add_argument("--patience", type=int, default=8)
@@ -702,6 +722,7 @@ def parse_arguments():
             "mobilenet_v3_small",
             "efficientnet_b0",
             "medsiglip",
+            "featbank",
         ],
         help="Model family to use. Lighter CNNs are much faster than the ViT variants.",
     )
@@ -803,10 +824,17 @@ def parse_arguments():
         default=None,
         help="Optional checkpoint path used to warm-start compatible layers.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def parse_args(argv=None):
+    args = parse_arguments(argv)
+    if args.select_metric is None:
+        args.select_metric = "per_task_mean" if args.model_type == "featbank" else "loss"
+    return args
 
 
 if __name__ == "__main__":
-    parsed_args = parse_arguments()
+    parsed_args = parse_args()
     maybe_load_search_config(parsed_args)
     run(parsed_args)

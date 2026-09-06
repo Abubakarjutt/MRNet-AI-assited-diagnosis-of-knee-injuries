@@ -132,3 +132,79 @@ python vlm_finetune.py --prefix_name medgemma_full --epochs 1 \
    better prior adapter is left untouched. Fast tests use a hand-built fake processor/model
    in `conftest.py`; the real-model paths are `@pytest.mark.slow` (see
    `tests/test_vlm_real.py`).
+
+## Path 3 — Multi-encoder feature bank (`--model_type featbank`)
+
+A single 3-head classifier trained on **cached features** from frozen encoders
+(MedSigLIP-448 + DINOv2 ViT-B/14). Encoders run once, offline; training then reads
+fp16 feature files, so an epoch is seconds and 5-fold CV is cheap. Design:
+`docs/superpowers/specs/2026-09-05-multiencoder-pertask-mrnet-design.md`.
+
+### One-time setup
+
+1. `export HF_TOKEN=...` (MedSigLIP is gated; DINOv2 is not).
+2. `export PYTORCH_ENABLE_MPS_FALLBACK=1`
+3. `pip install -r requirements.txt`
+4. Ensure **≥ 16 GB free disk** before the cache build (the patch-grid pass is
+   gated; override with `--allow_low_disk` at your own risk).
+
+### Build the feature cache (~hours on MPS, one time)
+
+```bash
+python scripts/build_feature_cache.py \
+  --data_root MRNet-v1.0 \
+  --encoders medsiglip,dinov2 \
+  --variants clean,hflip,rotp,rotn,slicesB,slicesC \
+  --slices_per_plane 32 --want_patch_for meniscus \
+  --out feature_cache/
+```
+
+Idempotent and resumable: re-running skips finished `<enc>/<variant>/<split>/<exam>.pt`.
+
+### C1 sanity check (single encoder, pooled only, CV)
+
+```bash
+python scripts/cv_select.py --feature_cache feature_cache/ --data_root MRNet-v1.0 \
+  --encoders medsiglip --cache_variants clean,hflip,slicesB \
+  --epochs 15 --k 5 --out cv_c1.tsv
+```
+Bar: mean per-task AUC ≥ **0.85**. If missed, frozen features are too weak — stop.
+
+### C2 full phase-1 run (both encoders, meniscus pyramid, CV then 120-val once)
+
+```bash
+# CV for hyperparameters (sweeps d_model {192,256,384})
+python scripts/cv_select.py --feature_cache feature_cache/ --data_root MRNet-v1.0 \
+  --encoders medsiglip,dinov2 --epochs 25 --sweep_d_model 1 --k 5 --out cv_c2.tsv
+
+# then the honest 120-val number, once, with the winning d_model
+python train.py --prefix_name featbank_c2 --model_type featbank \
+  --feature_cache feature_cache/ --data_root MRNet-v1.0 \
+  --encoders medsiglip,dinov2 --d_model 256 --epochs 25 \
+  --eval_tta_variants clean,hflip --save_model 1
+```
+Bars: meniscus ≥ **0.88**, ACL ≥ **0.95**, abnormal ≥ **0.93**.
+
+### Flags
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--feature_cache` | `""` | cache dir written by `build_feature_cache.py` |
+| `--encoders` | `medsiglip,dinov2` | comma list; add a third here for phase 2 (re-cache first) |
+| `--cache_variants` | all six | training-time variant pool (one sampled per epoch per exam) |
+| `--slices_used` / `--slices_used_meniscus` | `24` / `32` | subsample of the 32 cached slices |
+| `--d_model` | `256` | common projection width |
+| `--featbank_batch_size` | `16` | real minibatches (slice count is fixed post-subsample) |
+| `--eval_tta_variants` | `clean` | variants averaged at eval (TTA) |
+| `--cv_folds` / `--cv_fold` | `0` / `-1` | set by `cv_select.py`; leave default for a 120-val run |
+| `--select_metric` | *(auto)* | `per_task_mean` for `featbank`, `loss` otherwise; override explicitly if needed |
+
+### Notes
+
+- The frozen encoders never enter the training loop — only
+  `scripts/build_feature_cache.py` constructs them. `run_featbank` starts from
+  cached tensors.
+- All tuning is done on 5-fold CV over the 1130 train exams (`cv_select.py`). Read
+  the 120-val AUC once per phase; treating it as a tuning signal overfits it.
+- Checkpoints: `model_<prefix>_featbank_ptmean_<x>_epoch_<e>.pth`, one best per run,
+  prior `<prefix>` files pruned on each new best.
